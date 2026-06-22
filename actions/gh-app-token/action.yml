@@ -1,0 +1,46 @@
+name: gh-app-token
+description: >-
+  Mint a short-lived GitHub App installation token via Vault OIDC. Drop-in
+  replacement for "push as us" PATs — no long-lived secret is stored in GitHub.
+  MUST run on the in-cluster self-hosted runners (Vault is internal-only).
+
+inputs:
+  owner:
+    description: Org/owner to scope the token to. Defaults to the calling repo's owner.
+    required: false
+    default: ${{ github.repository_owner }}
+
+outputs:
+  token:
+    description: Short-lived (~1h) GitHub App installation token.
+    value: ${{ steps.app-token.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    # 1. Exchange this job's GitHub OIDC JWT for the App key, straight from Vault.
+    #    Trust is org-wildcarded on the repository_owner claim (Vault role jwt-github/ci),
+    #    so any repo in an allowed org works with zero per-repo config.
+    - name: Fetch GitHub App key from Vault (GitHub OIDC -> jwt-github/ci)
+      uses: hashicorp/vault-action@v3
+      with:
+        url: https://vault.vault.svc.cluster.local:8200   # in-cluster service; no ingress hop
+        method: jwt
+        path: jwt-github
+        role: ci
+        jwtGithubAudience: https://vault.internal          # must match the role's bound_audiences
+        tlsSkipVerify: true                                # internal self-signed CA (pin caCertificate to tighten)
+        exportToken: false
+        secrets: |
+          kv/data/cluster/_shared/ci-github-app app_id | GH_APP_ID ;
+          kv/data/cluster/_shared/ci-github-app private_key | GH_APP_KEY
+
+    # 2. Mint the 1h installation token from the App key. Inherits the App's
+    #    permissions; auto-expires; scoped to `owner`; nothing to revoke.
+    - name: Mint installation token
+      id: app-token
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ env.GH_APP_ID }}
+        private-key: ${{ env.GH_APP_KEY }}
+        owner: ${{ inputs.owner }}
