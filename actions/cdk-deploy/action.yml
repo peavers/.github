@@ -1,17 +1,21 @@
 name: cdk-deploy
 description: >-
-  Deploy an AWS CDK app from a working directory. Assumes the shared
-  github-actions-ci role via OIDC — no stored AWS keys. The calling JOB must set
-  `permissions: id-token: write` (and `contents: read`). First deploy of a stack
-  with a DNS-validated ACM cert will pause until the validation record exists in
-  DNS (add it in Cloudflare, grey cloud).
+  Deploy an AWS CDK app. Assumes the shared github-actions-ci role via OIDC — no
+  stored AWS keys. The calling JOB must set `permissions: id-token: write` (and
+  `contents: read`).
+
+  Optionally fully automates Cloudflare DNS for an ACM-backed CloudFront site:
+  when `domain` + `cloudflare-zone` are given, it publishes the ACM validation
+  CNAME during deploy (so the cert issues hands-off) and upserts the site CNAME
+  -> CloudFront afterwards. That path needs a Cloudflare API token in Vault at
+  kv/data/cluster/_shared/cloudflare-dns (key `api_token`, scope Zone.DNS:Edit)
+  and MUST run on the in-cluster self-hosted runners (Vault is internal-only).
 
 inputs:
   working-directory:
     description: Directory containing the CDK app (cdk.json).
     required: true
   node-version:
-    description: Node.js version.
     required: false
     default: "20"
   aws-account:
@@ -27,13 +31,28 @@ inputs:
     required: false
     default: arn:aws:iam::665316247771:role/github-actions-ci
   install-command:
-    description: Dependency install command.
     required: false
     default: npm install
   deploy-command:
-    description: CDK deploy command.
     required: false
     default: npx cdk deploy --require-approval never
+  # --- optional Cloudflare DNS automation ---
+  domain:
+    description: Site hostname to manage in Cloudflare (e.g. peavers.io). Enables DNS automation when set with cloudflare-zone.
+    required: false
+    default: ""
+  cloudflare-zone:
+    description: Cloudflare zone name the domain lives in (e.g. peavers.io).
+    required: false
+    default: ""
+  distribution-id-param:
+    description: SSM parameter holding the CloudFront distribution id (used to resolve the CNAME target).
+    required: false
+    default: ""
+  cloudflare-proxied:
+    description: Whether the site CNAME is Cloudflare-proxied (orange). Keep false so CloudFront/ACM own TLS.
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -54,10 +73,44 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       run: ${{ inputs.install-command }}
 
-    - name: CDK deploy
+    - name: Fetch Cloudflare API token from Vault
+      if: inputs.domain != '' && inputs.cloudflare-zone != ''
+      uses: hashicorp/vault-action@v3
+      with:
+        url: https://vault.vault.svc.cluster.local:8200
+        method: jwt
+        path: jwt-github
+        role: ci
+        jwtGithubAudience: https://vault.internal
+        tlsSkipVerify: true
+        exportToken: false
+        secrets: |
+          kv/data/cluster/_shared/cloudflare-dns api_token | CLOUDFLARE_API_TOKEN
+
+    - name: CDK deploy (with concurrent ACM DNS validation)
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         CDK_DEFAULT_ACCOUNT: ${{ inputs.aws-account }}
         CDK_DEFAULT_REGION: ${{ inputs.aws-region }}
-      run: ${{ inputs.deploy-command }}
+        DOMAIN: ${{ inputs.domain }}
+        CF_ZONE: ${{ inputs.cloudflare-zone }}
+      run: |
+        SYNC_PID=""
+        if [ -n "$DOMAIN" ] && [ -n "$CF_ZONE" ]; then
+          bash "$GITHUB_ACTION_PATH/sync-acm-validation.sh" "$DOMAIN" "$CF_ZONE" "$CDK_DEFAULT_REGION" &
+          SYNC_PID=$!
+        fi
+        ${{ inputs.deploy-command }}
+        if [ -n "$SYNC_PID" ]; then wait "$SYNC_PID" || true; fi
+
+    - name: Upsert site CNAME -> CloudFront
+      if: inputs.domain != '' && inputs.cloudflare-zone != '' && inputs.distribution-id-param != ''
+      shell: bash
+      run: |
+        bash "$GITHUB_ACTION_PATH/sync-site-cname.sh" \
+          "${{ inputs.domain }}" \
+          "${{ inputs.cloudflare-zone }}" \
+          "${{ inputs.distribution-id-param }}" \
+          "${{ inputs.cloudflare-proxied }}" \
+          "${{ inputs.aws-region }}"
