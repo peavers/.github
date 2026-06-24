@@ -2,7 +2,10 @@
 # Runs CONCURRENTLY with `cdk deploy`. Waits for the ACM certificate for $DOMAIN
 # to appear in PENDING_VALIDATION, then publishes its DNS validation CNAME to
 # Cloudflare so the cert issues without any manual step. Best-effort: never fails
-# the build (if the cert is already issued there's nothing to do).
+# the build.
+#
+# Fast path: if a cert for the domain is already ISSUED (e.g. a re-deploy), there
+# is nothing to validate, so exit immediately instead of polling.
 #
 # Usage: sync-acm-validation.sh <domain> <cloudflare-zone> [aws-region]
 set -uo pipefail
@@ -12,6 +15,19 @@ source "${DIR}/cloudflare-dns.sh"
 
 DOMAIN="$1"; ZONE="$2"; REGION="${3:-us-east-1}"
 _cf_require || exit 0
+
+# Is there already an ISSUED cert for this domain? (nothing to do)
+issued_cert() {
+  aws acm list-certificates --region "$REGION" --certificate-statuses ISSUED \
+    --query "CertificateSummaryList[?DomainName=='${DOMAIN}'].CertificateArn | [0]" \
+    --output text 2>/dev/null
+}
+
+iss=$(issued_cert)
+if [ -n "$iss" ] && [ "$iss" != "None" ]; then
+  echo "cloudflare: ACM cert for ${DOMAIN} already issued; nothing to validate"
+  exit 0
+fi
 
 ZID=$(cf_zone_id "$ZONE")
 [ -n "$ZID" ] || { echo "::warning::cloudflare zone '${ZONE}' not found; skipping ACM validation sync"; exit 0; }
@@ -34,7 +50,13 @@ for _ in $(seq 1 60); do
       exit 0
     fi
   fi
+  # The cert may have issued out from under us (record published by a prior run).
+  iss=$(issued_cert)
+  if [ -n "$iss" ] && [ "$iss" != "None" ]; then
+    echo "cloudflare: ACM cert for ${DOMAIN} issued; done"
+    exit 0
+  fi
   sleep 10
 done
-echo "cloudflare: no pending ACM validation record for ${DOMAIN} within timeout (cert likely already issued)"
+echo "cloudflare: no pending ACM validation record for ${DOMAIN} within timeout"
 exit 0
