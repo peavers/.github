@@ -3,12 +3,20 @@ name: CDK Deploy (reusable)
 # Deploy an AWS CDK app. Call this from a repo with just triggers + the infra
 # directory; the deploy logic lives in the cdk-deploy composite action.
 #
+# Pass `domain` + `cloudflare-zone` (+ `distribution-id-param`) to fully automate
+# Cloudflare DNS — the ACM validation CNAME is published during deploy and the
+# site CNAME -> CloudFront afterwards (needs the Vault Cloudflare token; see the
+# cdk-deploy action).
+#
 # Example caller:
 #   jobs:
 #     infra:
 #       uses: peavers/.github/.github/workflows/cdk-deploy.yml@main
 #       with:
 #         working-directory: infra
+#         domain: peavers.io
+#         cloudflare-zone: peavers.io
+#         distribution-id-param: /peavers/landing/distribution-id
 
 on:
   workflow_call:
@@ -37,6 +45,25 @@ on:
         required: false
         type: string
         default: npm install
+      domain:
+        description: Site hostname to manage in Cloudflare (enables DNS automation).
+        required: false
+        type: string
+        default: ""
+      cloudflare-zone:
+        description: Cloudflare zone name (e.g. peavers.io).
+        required: false
+        type: string
+        default: ""
+      distribution-id-param:
+        description: SSM parameter with the CloudFront distribution id (for the site CNAME).
+        required: false
+        type: string
+        default: ""
+      cloudflare-proxied:
+        required: false
+        type: string
+        default: "false"
 
 permissions:
   contents: read
@@ -57,3 +84,7 @@ jobs:
           aws-account: ${{ inputs.aws-account }}
           aws-region: ${{ inputs.aws-region }}
           install-command: ${{ inputs.install-command }}
+          domain: ${{ inputs.domain }}
+          cloudflare-zone: ${{ inputs.cloudflare-zone }}
+          distribution-id-param: ${{ inputs.distribution-id-param }}
+          cloudflare-proxied: ${{ inputs.cloudflare-proxied }}
