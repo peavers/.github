@@ -1,0 +1,90 @@
+name: Static Site Deploy (reusable)
+
+# Build a static site and deploy it to S3 + CloudFront. Call this from a repo
+# with just triggers + inputs; the deploy logic lives here and in the
+# deploy-s3-cloudfront composite action.
+#
+# Example caller:
+#   jobs:
+#     deploy:
+#       uses: peavers/.github/.github/workflows/static-site-deploy.yml@main
+#       with:
+#         bucket: peavers-io-landing
+#         distribution-id-param: /peavers/landing/distribution-id
+
+on:
+  workflow_call:
+    inputs:
+      bucket:
+        description: Target S3 bucket name.
+        required: true
+        type: string
+      distribution-id-param:
+        description: SSM parameter holding the CloudFront distribution id.
+        required: true
+        type: string
+      runner:
+        description: Runner label.
+        required: false
+        type: string
+        default: warcraft-runners
+      working-directory:
+        description: Directory to build in (for monorepos).
+        required: false
+        type: string
+        default: "."
+      node-version:
+        required: false
+        type: string
+        default: "20"
+      install-command:
+        required: false
+        type: string
+        default: npm install
+      build-command:
+        required: false
+        type: string
+        default: npm run build
+      dist-subdir:
+        description: Built output dir, relative to working-directory.
+        required: false
+        type: string
+        default: dist
+      aws-region:
+        required: false
+        type: string
+        default: us-east-1
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-deploy:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.install-command }}
+
+      - name: Build
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.build-command }}
+
+      - name: Deploy to S3 + CloudFront
+        uses: peavers/.github/actions/deploy-s3-cloudfront@main
+        with:
+          bucket: ${{ inputs.bucket }}
+          distribution-id-param: ${{ inputs.distribution-id-param }}
+          dist-path: ${{ inputs.working-directory }}/${{ inputs.dist-subdir }}
+          aws-region: ${{ inputs.aws-region }}

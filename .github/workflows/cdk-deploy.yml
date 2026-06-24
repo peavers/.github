@@ -1,0 +1,59 @@
+name: CDK Deploy (reusable)
+
+# Deploy an AWS CDK app. Call this from a repo with just triggers + the infra
+# directory; the deploy logic lives in the cdk-deploy composite action.
+#
+# Example caller:
+#   jobs:
+#     infra:
+#       uses: peavers/.github/.github/workflows/cdk-deploy.yml@main
+#       with:
+#         working-directory: infra
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing the CDK app (cdk.json).
+        required: true
+        type: string
+      runner:
+        required: false
+        type: string
+        default: warcraft-runners
+      node-version:
+        required: false
+        type: string
+        default: "20"
+      aws-account:
+        required: false
+        type: string
+        default: "665316247771"
+      aws-region:
+        required: false
+        type: string
+        default: us-east-1
+      install-command:
+        required: false
+        type: string
+        default: npm install
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cdk-deploy:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy CDK app
+        uses: peavers/.github/actions/cdk-deploy@main
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          node-version: ${{ inputs.node-version }}
+          aws-account: ${{ inputs.aws-account }}
+          aws-region: ${{ inputs.aws-region }}
+          install-command: ${{ inputs.install-command }}
