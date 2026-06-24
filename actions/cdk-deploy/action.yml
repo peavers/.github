@@ -1,0 +1,63 @@
+name: cdk-deploy
+description: >-
+  Deploy an AWS CDK app from a working directory. Assumes the shared
+  github-actions-ci role via OIDC — no stored AWS keys. The calling JOB must set
+  `permissions: id-token: write` (and `contents: read`). First deploy of a stack
+  with a DNS-validated ACM cert will pause until the validation record exists in
+  DNS (add it in Cloudflare, grey cloud).
+
+inputs:
+  working-directory:
+    description: Directory containing the CDK app (cdk.json).
+    required: true
+  node-version:
+    description: Node.js version.
+    required: false
+    default: "20"
+  aws-account:
+    description: AWS account id (exported as CDK_DEFAULT_ACCOUNT).
+    required: false
+    default: "665316247771"
+  aws-region:
+    description: AWS region (exported as CDK_DEFAULT_REGION).
+    required: false
+    default: us-east-1
+  role-to-assume:
+    description: IAM role to assume via GitHub OIDC.
+    required: false
+    default: arn:aws:iam::665316247771:role/github-actions-ci
+  install-command:
+    description: Dependency install command.
+    required: false
+    default: npm install
+  deploy-command:
+    description: CDK deploy command.
+    required: false
+    default: npx cdk deploy --require-approval never
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials (OIDC — no stored keys)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: ${{ inputs.install-command }}
+
+    - name: CDK deploy
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CDK_DEFAULT_ACCOUNT: ${{ inputs.aws-account }}
+        CDK_DEFAULT_REGION: ${{ inputs.aws-region }}
+      run: ${{ inputs.deploy-command }}

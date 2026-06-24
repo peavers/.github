@@ -1,0 +1,62 @@
+name: deploy-s3-cloudfront
+description: >-
+  Deploy a pre-built static site directory to S3 (behind CloudFront) and
+  invalidate the distribution. Assumes the shared github-actions-ci role via
+  OIDC — no stored AWS keys. The calling JOB must set `permissions: id-token:
+  write` (and `contents: read`). Run AFTER your build step; point `dist-path` at
+  the built output.
+
+inputs:
+  bucket:
+    description: Target S3 bucket name (the CloudFront origin).
+    required: true
+  distribution-id-param:
+    description: SSM parameter name holding the CloudFront distribution id (published by the CDK stack).
+    required: true
+  dist-path:
+    description: Path to the built site directory to upload.
+    required: false
+    default: dist
+  aws-region:
+    description: AWS region for the API calls / SSM lookup.
+    required: false
+    default: us-east-1
+  role-to-assume:
+    description: IAM role to assume via GitHub OIDC.
+    required: false
+    default: arn:aws:iam::665316247771:role/github-actions-ci
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials (OIDC — no stored keys)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    # Hashed asset filenames -> cache forever; index.html stays fresh so new
+    # deploys are picked up immediately (after the invalidation below).
+    - name: Sync assets (immutable)
+      shell: bash
+      run: |
+        aws s3 sync "${{ inputs.dist-path }}/" "s3://${{ inputs.bucket }}" \
+          --delete \
+          --cache-control "public,max-age=31536000,immutable" \
+          --exclude "index.html"
+
+    - name: Upload index.html (no-cache)
+      shell: bash
+      run: |
+        aws s3 cp "${{ inputs.dist-path }}/index.html" \
+          "s3://${{ inputs.bucket }}/index.html" \
+          --cache-control "no-cache"
+
+    - name: Invalidate CloudFront
+      shell: bash
+      run: |
+        DIST_ID=$(aws ssm get-parameter \
+          --name "${{ inputs.distribution-id-param }}" \
+          --query 'Parameter.Value' --output text)
+        aws cloudfront create-invalidation \
+          --distribution-id "$DIST_ID" --paths "/*"
