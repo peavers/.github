@@ -23,5 +23,9 @@ cf_domain=$(aws cloudfront get-distribution --id "$dist_id" \
 [ -n "$cf_domain" ] && [ "$cf_domain" != "None" ] || { echo "::error::could not resolve CloudFront domain for ${dist_id}"; exit 1; }
 
 # DNS-only by default: CloudFront/ACM own TLS, so no Cloudflare proxy needed.
-cf_upsert_cname "$ZID" "$DOMAIN" "$cf_domain" "$PROXIED"
-echo "cloudflare: ${DOMAIN} -> ${cf_domain}"
+# Fail loudly if Cloudflare rejects it (e.g. a conflicting record already exists
+# at the apex) instead of silently leaving the hostname pointed at the old origin.
+if ! cf_upsert_cname "$ZID" "$DOMAIN" "$cf_domain" "$PROXIED"; then
+  echo "::error::Could not point ${DOMAIN} at ${cf_domain}. If this is an apex, delete the pre-existing A/CNAME record (e.g. the old hosting provider's) and re-run." >&2
+  exit 1
+fi

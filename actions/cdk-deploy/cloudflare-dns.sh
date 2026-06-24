@@ -21,24 +21,32 @@ cf_zone_id() {
 }
 
 # cf_upsert_cname <zone-id> <name> <content> [proxied:true|false]
-# Creates or updates a CNAME so re-runs are safe.
+# Creates or updates a CNAME so re-runs are safe. Returns non-zero (and prints a
+# ::error:: with Cloudflare's own message) if the API rejects the change — e.g. a
+# conflicting record already exists at the name (an A record at the apex). We
+# check the API's `success` field rather than just curl's exit code so a 200-with-
+# errors response can't masquerade as success.
 cf_upsert_cname() {
   local zone_id="$1" name="${2%.}" content="${3%.}" proxied="${4:-false}"
-  local existing body
-  existing=$(curl -sf -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+  local existing body resp
+  existing=$(curl -s -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
     "${CF_API}/zones/${zone_id}/dns_records?type=CNAME&name=${name}" \
     | jq -r '.result[0].id // empty')
   body=$(jq -nc --arg n "$name" --arg c "$content" --argjson p "$proxied" \
     '{type:"CNAME",name:$n,content:$c,proxied:$p,ttl:1}')
   if [ -n "$existing" ]; then
-    curl -sf -X PUT -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    resp=$(curl -s -X PUT -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
       -H "Content-Type: application/json" \
-      "${CF_API}/zones/${zone_id}/dns_records/${existing}" --data "$body" >/dev/null \
-      && echo "cloudflare: updated CNAME ${name} -> ${content} (proxied=${proxied})"
+      "${CF_API}/zones/${zone_id}/dns_records/${existing}" --data "$body")
   else
-    curl -sf -X POST -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    resp=$(curl -s -X POST -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
       -H "Content-Type: application/json" \
-      "${CF_API}/zones/${zone_id}/dns_records" --data "$body" >/dev/null \
-      && echo "cloudflare: created CNAME ${name} -> ${content} (proxied=${proxied})"
+      "${CF_API}/zones/${zone_id}/dns_records" --data "$body")
+  fi
+  if [ "$(printf '%s' "$resp" | jq -r '.success // false')" = "true" ]; then
+    echo "cloudflare: upserted CNAME ${name} -> ${content} (proxied=${proxied})"
+  else
+    echo "::error::Cloudflare rejected CNAME ${name} -> ${content}: $(printf '%s' "$resp" | jq -c '.errors // .')" >&2
+    return 1
   fi
 }
