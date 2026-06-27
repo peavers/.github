@@ -1,0 +1,27 @@
+name: compute-version
+description: >-
+  Derive an immutable image version for the current ref: the semver from a
+  v* tag (leading "v" stripped), otherwise the 7-char commit SHA. Also emits a
+  comma-separated "latest,<version>" tag list ready for Jib / build-push-action.
+
+outputs:
+  version:
+    description: Immutable version — semver from a v* tag, else the 7-char SHA.
+    value: ${{ steps.calc.outputs.version }}
+  tags:
+    description: Comma-separated tag list "latest,<version>".
+    value: ${{ steps.calc.outputs.tags }}
+
+runs:
+  using: composite
+  steps:
+    - id: calc
+      shell: bash
+      run: |
+        if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          VERSION="${GITHUB_REF_NAME#v}"
+        else
+          VERSION="${GITHUB_SHA::7}"
+        fi
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "tags=latest,${VERSION}" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,60 @@
+name: K8s Deploy (reusable)
+
+# Roll one or more Kubernetes deployments to a new image version via
+# `kubectl set image` + `kubectl rollout status`. Runs on the self-hosted
+# in-cluster runners (they carry the cluster kubeconfig).
+#
+# `targets` is a JSON array of objects:
+#   [{ "deployment": "...", "container": "...", "image": "...", "timeout": "300s" }]
+# The image is pinned as "<image>:<version>".
+#
+# Example caller:
+#   jobs:
+#     deploy:
+#       needs: [server, web]
+#       uses: peavers/.github/.github/workflows/k8s-deploy.yml@main
+#       with:
+#         namespace: resonance
+#         version: ${{ needs.server.outputs.version }}
+#         runner: peavers-code-runners
+#         targets: >-
+#           [{"deployment":"resonance-server","container":"server","image":"docker.valhalla.life/peavers/resonance-server","timeout":"300s"}]
+
+on:
+  workflow_call:
+    inputs:
+      namespace:
+        description: Kubernetes namespace.
+        required: true
+        type: string
+      version:
+        description: Immutable image tag to deploy (from a build job's output).
+        required: true
+        type: string
+      targets:
+        description: JSON array of {deployment, container, image, timeout}.
+        required: true
+        type: string
+      runner:
+        required: false
+        type: string
+        default: warcraft-runners
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+      fail-fast: false
+    steps:
+      - name: Set image & wait for rollout
+        run: |
+          kubectl set image \
+            "deployment/${{ matrix.target.deployment }}" \
+            "${{ matrix.target.container }}=${{ matrix.target.image }}:${{ inputs.version }}" \
+            -n "${{ inputs.namespace }}"
+          kubectl rollout status \
+            "deployment/${{ matrix.target.deployment }}" \
+            -n "${{ inputs.namespace }}" \
+            --timeout="${{ matrix.target.timeout || '300s' }}"

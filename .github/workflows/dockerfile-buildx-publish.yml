@@ -1,0 +1,105 @@
+name: Dockerfile Buildx Publish (reusable)
+
+# Build a Dockerfile-based image (e.g. a React/nginx frontend) with Buildx and
+# push it to Harbor. Harbor creds come from in-cluster Vault (no stored secrets),
+# so this MUST run on the self-hosted in-cluster runners.
+#
+# Example caller:
+#   permissions: { id-token: write, contents: read }
+#   jobs:
+#     web:
+#       uses: peavers/.github/.github/workflows/dockerfile-buildx-publish.yml@main
+#       with:
+#         context: resonance-web
+#         image: docker.valhalla.life/peavers/resonance-web
+#         runner: peavers-code-runners
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: Build context directory.
+        required: true
+        type: string
+      image:
+        description: Full image reference to push (registry/repo, no tag).
+        required: true
+        type: string
+      platforms:
+        required: false
+        type: string
+        default: linux/amd64
+      file:
+        description: Dockerfile path. Defaults to <context>/Dockerfile.
+        required: false
+        type: string
+        default: ""
+      runner:
+        required: false
+        type: string
+        default: warcraft-runners
+      registry:
+        description: Container registry host (for docker login).
+        required: false
+        type: string
+        default: docker.valhalla.life
+    outputs:
+      version:
+        description: Immutable version pushed (semver from tag, else 7-char SHA).
+        value: ${{ jobs.build.outputs.version }}
+      tags:
+        description: Comma-separated tag list "latest,<version>".
+        value: ${{ jobs.build.outputs.tags }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tags: ${{ steps.version.outputs.tags }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch Harbor credentials from Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://vault.vault.svc.cluster.local:8200
+          method: jwt
+          path: jwt-github
+          role: ci
+          jwtGithubAudience: https://vault.internal
+          tlsSkipVerify: true
+          exportToken: false
+          secrets: |
+            kv/data/cluster/_shared/harbor username | HARBOR_USERNAME ;
+            kv/data/cluster/_shared/harbor password | HARBOR_PASSWORD
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ env.HARBOR_USERNAME }}
+          password: ${{ env.HARBOR_PASSWORD }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute version
+        id: version
+        uses: peavers/.github/actions/compute-version@main
+
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file != '' && inputs.file || format('{0}/Dockerfile', inputs.context) }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: |
+            ${{ inputs.image }}:latest
+            ${{ inputs.image }}:${{ steps.version.outputs.version }}

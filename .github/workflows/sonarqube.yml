@@ -1,0 +1,214 @@
+name: SonarQube (reusable)
+
+# Build/test a Gradle (Spring Boot) backend with JaCoCo coverage, optionally
+# build a Node frontend, then run a SonarQube scan + quality gate. Runs on the
+# self-hosted in-cluster runners so the Sonar token can come from Vault (no
+# stored secrets). The consuming repo keeps its own sonar-project.properties.
+#
+# Example caller:
+#   permissions: { id-token: write, contents: read }
+#   jobs:
+#     sonar:
+#       uses: peavers/.github/.github/workflows/sonarqube.yml@main
+#       with:
+#         gradle-directory: resonance-server
+#         node-enabled: true
+#         node-directory: resonance-web
+#         runner: peavers-code-runners
+
+on:
+  workflow_call:
+    inputs:
+      gradle-directory:
+        description: Directory containing the Gradle build.
+        required: true
+        type: string
+      java-version:
+        required: false
+        type: string
+        default: "25"
+      java-distribution:
+        required: false
+        type: string
+        default: temurin
+      jacoco-report:
+        description: JaCoCo XML report path, relative to gradle-directory.
+        required: false
+        type: string
+        default: build/reports/jacoco/test/jacocoTestReport.xml
+      node-enabled:
+        required: false
+        type: boolean
+        default: false
+      node-directory:
+        required: false
+        type: string
+        default: ""
+      node-version:
+        required: false
+        type: string
+        default: "20"
+      spring-profile:
+        required: false
+        type: string
+        default: test
+      postgres-db:
+        required: false
+        type: string
+        default: postgres
+      postgres-user:
+        required: false
+        type: string
+        default: postgres
+      postgres-password:
+        required: false
+        type: string
+        default: postgres
+      runner:
+        required: false
+        type: string
+        default: warcraft-runners
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  backend:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ${{ inputs.postgres-user }}
+          POSTGRES_PASSWORD: ${{ inputs.postgres-password }}
+          POSTGRES_DB: ${{ inputs.postgres-db }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+          cache: gradle
+
+      - name: Build, test & coverage
+        working-directory: ${{ inputs.gradle-directory }}
+        env:
+          SPRING_PROFILES_ACTIVE: ${{ inputs.spring-profile }}
+        run: ./gradlew clean build test jacocoTestReport --no-daemon
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: ${{ inputs.gradle-directory }}/${{ inputs.jacoco-report }}
+
+      - name: Upload compiled classes
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-classes
+          path: ${{ inputs.gradle-directory }}/build/classes
+
+  frontend:
+    if: ${{ inputs.node-enabled }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.node-directory }}/package-lock.json
+
+      - name: Install & build
+        working-directory: ${{ inputs.node-directory }}
+        env:
+          CI: "true"
+        run: |
+          npm ci
+          npm run build
+
+  sonarqube:
+    needs: [backend, frontend]
+    if: ${{ always() && needs.backend.result == 'success' && (needs.frontend.result == 'success' || needs.frontend.result == 'skipped') }}
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve coverage report directory
+        id: paths
+        run: echo "report-dir=$(dirname "${{ inputs.jacoco-report }}")" >> "$GITHUB_OUTPUT"
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: jacoco-report
+          path: ${{ inputs.gradle-directory }}/${{ steps.paths.outputs.report-dir }}
+
+      - name: Download compiled classes
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-classes
+          path: ${{ inputs.gradle-directory }}/build/classes
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Fetch SonarQube credentials from Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://vault.vault.svc.cluster.local:8200
+          method: jwt
+          path: jwt-github
+          role: ci
+          jwtGithubAudience: https://vault.internal
+          tlsSkipVerify: true
+          exportToken: false
+          secrets: |
+            kv/data/cluster/_shared/sonarqube token | SONAR_TOKEN ;
+            kv/data/cluster/_shared/sonarqube host_url | SONAR_HOST_URL
+
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+
+      - name: SonarQube quality gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
