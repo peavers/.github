@@ -1,0 +1,69 @@
+name: MkDocs Pages (reusable)
+
+# Build an MkDocs site and deploy it to GitHub Pages. No Vault/registry access
+# needed, so this runs on GitHub-hosted runners. The caller must grant Pages
+# permissions and set the pages concurrency group.
+#
+# Example caller:
+#   permissions: { contents: read, pages: write, id-token: write }
+#   concurrency: { group: pages, cancel-in-progress: false }
+#   jobs:
+#     docs:
+#       uses: peavers/.github/.github/workflows/mkdocs-pages.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        required: false
+        type: string
+        default: "3.x"
+      pip-packages:
+        description: Space-separated pip packages to install before building.
+        required: false
+        type: string
+        default: mkdocs-material
+      site-dir:
+        description: MkDocs output directory.
+        required: false
+        type: string
+        default: site
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        run: pip install ${{ inputs.pip-packages }}
+
+      - name: Build site
+        run: mkdocs build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ inputs.site-dir }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

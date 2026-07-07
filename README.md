@@ -9,8 +9,16 @@ orgs (this repo is public, so cross-org references need no extra config).
 ```
 actions/                 composite actions  ->  uses: peavers/.github/actions/<name>@main
   gh-app-token/          mint a GitHub App token via Vault OIDC (PAT replacement)
+  compute-version/       derive an immutable image tag (semver / 7-char SHA)
 .github/
   workflows/             reusable workflows ->  uses: peavers/.github/.github/workflows/<file>@main
+    gradle-jib-publish        build a Spring Boot service with Jib -> Harbor
+    dockerfile-buildx-publish build a Dockerfile image with Buildx -> Harbor
+    k8s-deploy                kubectl set image + rollout for N deployments
+    sonarqube                 Gradle + optional Node coverage -> SonarQube scan
+    mkdocs-pages              build MkDocs -> deploy to GitHub Pages
+    cdk-deploy                deploy an AWS CDK app (+ optional Cloudflare DNS)
+    static-site-deploy        build a static site -> S3 + CloudFront
 workflow-templates/      org "New workflow" gallery (peavers org repos)
 ```
 
@@ -62,6 +70,38 @@ Notes:
   not) — usually the whole reason a PAT was there.
 - Need `packages:write` / `pull-requests:write` etc.? Grant it on the **GitHub
   App**; the installation token inherits the App's permissions.
+
+### `actions/compute-version` — immutable image tag
+
+Outputs `version` (the semver from a `v*` tag with the leading `v` stripped,
+otherwise the 7-char commit SHA) and `tags` (`latest,<version>`). Used by the
+build workflows below so every push gets a unique, reproducible tag.
+
+## Reusable workflows — JVM services (Harbor + K8s)
+
+The Gradle/Spring Boot service pipeline. All build/deploy jobs pull Harbor and
+SonarQube creds from in-cluster Vault, so they **MUST run on the self-hosted
+in-cluster runners** (`warcraft-runners` by default; pass `runner:` to override,
+e.g. `peavers-code-runners`). The calling job must set
+`permissions: { id-token: write, contents: read }` for the Vault OIDC exchange.
+
+- `gradle-jib-publish.yml` — `./gradlew jib` -> Harbor. Inputs: `working-directory`,
+  `image`, `java-version` (25), `runner`, `registry`. Outputs `version`/`tags`.
+- `dockerfile-buildx-publish.yml` — Buildx build -> Harbor. Inputs: `context`,
+  `image`, `platforms`, `file`, `runner`, `registry`. Outputs `version`/`tags`.
+- `k8s-deploy.yml` — `kubectl set image` + `rollout status`. Inputs: `namespace`,
+  `version`, `targets` (JSON array of `{deployment, container, image, timeout}`),
+  `runner`.
+- `sonarqube.yml` — Gradle build/test + JaCoCo (postgres + redis service
+  containers) and an optional Node build, then a Sonar scan + quality gate.
+  Inputs: `gradle-directory`, `node-enabled`, `node-directory`, `java-version`,
+  `runner`.
+- `mkdocs-pages.yml` — `mkdocs build` -> GitHub Pages (runs on `ubuntu-latest`;
+  no Vault). Caller keeps `pages: write` / `id-token: write` and
+  `concurrency: { group: pages }`.
+
+**Vault prerequisites** (KV under `kv/data/cluster/_shared/`): `harbor`
+(`username`, `password`) and `sonarqube` (`token`, `host_url`).
 
 ## Conventions
 

@@ -1,0 +1,104 @@
+name: Gradle Jib Publish (reusable)
+
+# Build a Spring Boot service with the Jib Gradle plugin and push it to Harbor.
+# Harbor creds come from in-cluster Vault (no stored secrets), so this MUST run
+# on the self-hosted in-cluster runners. Exposes the computed version/tags as
+# outputs so a downstream deploy job can pin the exact image.
+#
+# Example caller:
+#   permissions: { id-token: write, contents: read }
+#   jobs:
+#     server:
+#       uses: peavers/.github/.github/workflows/gradle-jib-publish.yml@main
+#       with:
+#         working-directory: resonance-server
+#         image: docker.valhalla.life/peavers/resonance-server
+#         runner: peavers-code-runners
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing the Gradle build (with the Jib plugin).
+        required: true
+        type: string
+      image:
+        description: Full image reference to push (registry/repo, no tag).
+        required: true
+        type: string
+      java-version:
+        required: false
+        type: string
+        default: "25"
+      java-distribution:
+        required: false
+        type: string
+        default: temurin
+      runner:
+        required: false
+        type: string
+        default: warcraft-runners
+      registry:
+        description: Container registry host (for docker login).
+        required: false
+        type: string
+        default: docker.valhalla.life
+    outputs:
+      version:
+        description: Immutable version pushed (semver from tag, else 7-char SHA).
+        value: ${{ jobs.build.outputs.version }}
+      tags:
+        description: Comma-separated tag list "latest,<version>".
+        value: ${{ jobs.build.outputs.tags }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tags: ${{ steps.version.outputs.tags }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+
+      - name: Fetch Harbor credentials from Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://vault.vault.svc.cluster.local:8200
+          method: jwt
+          path: jwt-github
+          role: ci
+          jwtGithubAudience: https://vault.internal
+          tlsSkipVerify: true
+          exportToken: false
+          secrets: |
+            kv/data/cluster/_shared/harbor username | HARBOR_USERNAME ;
+            kv/data/cluster/_shared/harbor password | HARBOR_PASSWORD
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ env.HARBOR_USERNAME }}
+          password: ${{ env.HARBOR_PASSWORD }}
+
+      - name: Compute version
+        id: version
+        uses: peavers/.github/actions/compute-version@main
+
+      - name: Build & push image (Jib)
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          ./gradlew jib \
+            -Djib.to.image=${{ inputs.image }} \
+            -Djib.to.tags=${{ steps.version.outputs.tags }}
