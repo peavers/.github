@@ -62,6 +62,11 @@ permissions:
 jobs:
   build-deploy:
     runs-on: ${{ inputs.runner }}
+    # One deploy per bucket at a time, newest wins: a slow older run must not
+    # finish after a newer one and clobber the site with a stale build.
+    concurrency:
+      group: static-site-deploy-${{ inputs.bucket }}
+      cancel-in-progress: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
