@@ -14,6 +14,10 @@ name: Static Site Deploy (reusable)
 
 on:
   workflow_call:
+    secrets:
+      NEXUS_NPM_AUTH:
+        description: Base64 user:pass for packages.valhalla.life npm repos (optional).
+        required: false
     inputs:
       bucket:
         description: Target S3 bucket name.
@@ -77,6 +81,16 @@ jobs:
           node-version: ${{ inputs.node-version }}
           cache: npm
           cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Configure private npm registry
+        if: env.NEXUS_NPM_AUTH != ''
+        shell: bash
+        run: |
+          cat >> ~/.npmrc <<NPMRC
+          //packages.valhalla.life/repository/npm-group/:_auth=${NEXUS_NPM_AUTH}
+          NPMRC
+        env:
+          NEXUS_NPM_AUTH: ${{ secrets.NEXUS_NPM_AUTH }}
 
       - name: Install dependencies
         working-directory: ${{ inputs.working-directory }}
