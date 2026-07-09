@@ -66,6 +66,8 @@ permissions:
 jobs:
   build-deploy:
     runs-on: ${{ inputs.runner }}
+    env:
+      NEXUS_NPM_AUTH: ${{ secrets.NEXUS_NPM_AUTH }}
     # One deploy per bucket at a time, newest wins: a slow older run must not
     # finish after a newer one and clobber the site with a stale build.
     concurrency:
@@ -83,14 +85,12 @@ jobs:
           cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
 
       - name: Configure private npm registry
-        if: ${{ secrets.NEXUS_NPM_AUTH != '' }}
+        if: env.NEXUS_NPM_AUTH != ''
         shell: bash
         run: |
           cat >> ~/.npmrc <<NPMRC
           //packages.valhalla.life/repository/npm-group/:_auth=${NEXUS_NPM_AUTH}
           NPMRC
-        env:
-          NEXUS_NPM_AUTH: ${{ secrets.NEXUS_NPM_AUTH }}
 
       - name: Install dependencies
         working-directory: ${{ inputs.working-directory }}
