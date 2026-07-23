@@ -1,146 +1,110 @@
 name: cache-rust
 description: >-
-  Restore and save the Cargo build cache to the in-cluster MinIO bucket
-  (actions-cache), using the MINIO_* credentials the runners already carry.
+  Point the Rust compiler at a shared sccache backed by the in-cluster MinIO
+  bucket (actions-cache), using the MINIO_* credentials the runners already
+  carry.
 
-  Replaces the GitHub-hosted Actions cache for Rust. That cache has a hard 10 GB
-  per-repo limit and evicts least-recently-used; a Rust target dir is a few GB,
-  so a couple of branches in flight push it over and the next build restores
-  nothing — an eight-minute cold clippy at random. MinIO has no such ceiling and
-  sits inside the cluster, so the transfer is local rather than a round trip to
-  GitHub.
+  sccache caches individual compilation units in object storage, so a warm build
+  fetches only the objects it needs instead of moving a multi-gigabyte target
+  directory. That matters here because the runners are ephemeral (nothing
+  persists on disk) and GitHub's own cache evicts a Rust target dir under its
+  10 GB per-repo limit — leaving cold eight-minute clippy builds at random. MinIO
+  has no such ceiling and sits inside the cluster, so hits are local.
 
-  Called twice: once with phase=restore before the build, once with phase=save
-  after (with `if: always()` so a failed build still seeds the cache). A
-  composite action cannot register a post step, which is why this is not one
-  call.
+  Call once before the build. It installs sccache if absent, points it at MinIO,
+  and exports RUSTC_WRAPPER for the cargo steps that follow. There is nothing to
+  save afterwards — sccache writes through as the compiler runs.
 
 inputs:
-  phase:
-    description: 'restore — before the build; save — after it.'
-    required: true
-  key:
-    description: >-
-      Names the cache slot. Jobs that compile the same way should share one (the
-      clippy+test verify jobs do); jobs that do not should differ, so a release
-      build does not restore a test profile's target dir over its own.
+  version:
+    description: sccache release to install when the runner does not already have it.
     required: false
-    default: default
+    default: "0.8.2"
+  key-prefix:
+    description: >-
+      Namespaces this repo's objects within the bucket. Defaults to the repo, so
+      unrelated projects never collide or evict each other.
+    required: false
+    default: ""
 
 runs:
   using: composite
   steps:
     - shell: bash
       env:
-        PARSES_CACHE_PHASE: ${{ inputs.phase }}
-        PARSES_CACHE_KEY: ${{ inputs.key }}
+        SCCACHE_VERSION: ${{ inputs.version }}
+        SCCACHE_KEY_PREFIX_INPUT: ${{ inputs.key-prefix }}
       run: |
         set -euo pipefail
 
-        # The credentials are injected into every runner as MINIO_* by the
-        # arc-runners `minio-cache-credentials` secret. Absent them, this is a
-        # no-op rather than a failure: a runner set that has not been wired for
-        # the cache should still build, just cold.
+        # No credentials means no shared cache. Build cold rather than fail — a
+        # runner set that has not been wired for MinIO must still work.
         if [[ -z "${MINIO_ACCESS_KEY:-}" || -z "${MINIO_ENDPOINT:-}" ]]; then
-          echo "cache-rust: MINIO_* not present on this runner — skipping (${PARSES_CACHE_PHASE})."
+          echo "cache-rust: MINIO_* not present on this runner — building without sccache."
           exit 0
         fi
 
-        export AWS_ACCESS_KEY_ID="${MINIO_ACCESS_KEY}"
-        export AWS_SECRET_ACCESS_KEY="${MINIO_SECRET_KEY}"
-        export AWS_DEFAULT_REGION="us-east-1"
-        # MinIO addresses buckets in the path, not the hostname; the CLI defaults
-        # to virtual-hosted style, which resolves bucket.minio.minio.svc and
-        # fails. And there is no EC2 metadata endpoint in the cluster, so stop
-        # the CLI probing one and stalling for its timeout.
-        export AWS_EC2_METADATA_DISABLED=true
-        aws configure set default.s3.addressing_style path
-        ENDPOINT="http://${MINIO_ENDPOINT}:${MINIO_PORT:-9000}"
-        BUCKET="${MINIO_BUCKET:-actions-cache}"
-
-        # One moving object per (repo, slot, OS). Deliberately not keyed on the
-        # lockfile: restoring the previous run's target dir even when a
-        # dependency changed is the point — cargo recompiles what differs and
-        # reuses the rest, which is the whole reason a warm target dir turns an
-        # eight-minute build into one. A lockfile-keyed object would go cold on
-        # every dependency bump, which is exactly when a build is slowest.
-        SLOT="rust/${GITHUB_REPOSITORY}/${PARSES_CACHE_KEY}/${RUNNER_OS}"
-
-        # zstd at its fastest level, across every core. Its default is
-        # single-threaded at level 3, which turned a multi-gigabyte target dir
-        # into a six-minute save that would eat the whole saving. Level 1 on all
-        # cores cuts that to seconds, and the transfer is in-cluster so the
-        # slightly larger archive costs nothing. These are set through zstd's own
-        # environment variables rather than tar flags, because
-        # `--use-compress-program` takes one word and any args after it would be
-        # parsed by tar instead. Fall back to gzip only if the runner lacks zstd.
-        export ZSTD_CLEVEL=1 ZSTD_NBTHREADS=0
-        if command -v zstd >/dev/null 2>&1; then
-          EXT=tzst; TAR_C="tar -c --use-compress-program=zstd -f"; TAR_X="tar -x --use-compress-program=zstd -f"
-        else
-          EXT=tgz;  TAR_C="tar -cz -f"; TAR_X="tar -xz -f"
+        # Install sccache if the image does not already ship it. The static musl
+        # build has no runtime deps and is ~10 MB; fetching it costs a second or
+        # two against the minutes it saves.
+        if ! command -v sccache >/dev/null 2>&1; then
+          echo "cache-rust: installing sccache ${SCCACHE_VERSION}"
+          arch="$(uname -m)"; case "$arch" in
+            x86_64) triple="x86_64-unknown-linux-musl" ;;
+            aarch64|arm64) triple="aarch64-unknown-linux-musl" ;;
+            *) echo "cache-rust: no sccache build for ${arch} — building without it."; exit 0 ;;
+          esac
+          tarball="sccache-v${SCCACHE_VERSION}-${triple}"
+          url="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/${tarball}.tar.gz"
+          if ! curl -fsSL "$url" -o /tmp/sccache.tgz; then
+            echo "cache-rust: could not download sccache — building without it."
+            exit 0
+          fi
+          tar -xzf /tmp/sccache.tgz -C /tmp
+          # Prefer a PATH dir the runner owns; fall back to ~/.local/bin.
+          dest="$HOME/.local/bin"; mkdir -p "$dest"
+          install -m 0755 "/tmp/${tarball}/sccache" "$dest/sccache"
+          echo "$dest" >> "$GITHUB_PATH"
+          export PATH="$dest:$PATH"
         fi
-        OBJECT="s3://${BUCKET}/${SLOT}.${EXT}"
 
-        # The compiler's output plus the downloaded crate sources. CARGO_HOME
-        # defaults to ~/.cargo; honour an override so this keeps working if the
-        # runner image moves it.
-        #
-        # Everything is cached by absolute path and the archive is always
-        # extracted at / — GITHUB_WORKSPACE is deterministic per repo on these
-        # runners (/home/runner/_work/<repo>/<repo>), so target lands back
-        # exactly where cargo left it. Storing target relative to the workspace
-        # and cargo relative to / in one archive is the bug that puts target at
-        # /target on the way back; one root avoids it.
-        CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
-        PATHS=("$CARGO_HOME_DIR/registry" "$CARGO_HOME_DIR/git" "$GITHUB_WORKSPACE/target")
-        # Same paths with the leading slash stripped, for tar -C /.
-        REL_PATHS=("${CARGO_HOME_DIR#/}/registry" "${CARGO_HOME_DIR#/}/git" "${GITHUB_WORKSPACE#/}/target")
+        PREFIX="${SCCACHE_KEY_PREFIX_INPUT:-sccache/${GITHUB_REPOSITORY}}"
 
-        s3() { aws --endpoint-url "$ENDPOINT" s3 "$@"; }
+        # Persist the configuration for every step that follows in the job. sccache
+        # reads these; RUSTC_WRAPPER is what makes cargo route rustc through it.
+        {
+          echo "RUSTC_WRAPPER=sccache"
+          echo "SCCACHE_BUCKET=${MINIO_BUCKET:-actions-cache}"
+          echo "SCCACHE_ENDPOINT=${MINIO_ENDPOINT}:${MINIO_PORT:-9000}"
+          echo "SCCACHE_S3_USE_SSL=false"
+          echo "SCCACHE_S3_KEY_PREFIX=${PREFIX}"
+          echo "SCCACHE_REGION=us-east-1"
+          echo "AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}"
+          echo "AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}"
+          # No EC2 metadata endpoint in the cluster; stop the S3 client stalling
+          # on a probe for one.
+          echo "AWS_EC2_METADATA_DISABLED=true"
+          # sccache and cargo incremental fight — incremental keeps per-crate
+          # state that defeats a shared object cache. The runners already set
+          # this; assert it so a caller who did not still gets cache hits.
+          echo "CARGO_INCREMENTAL=0"
+        } >> "$GITHUB_ENV"
 
-        case "$PARSES_CACHE_PHASE" in
-          restore)
-            echo "cache-rust: restoring ${OBJECT}"
-            # A miss is ordinary — a fresh slot, or the first build after zstd
-            # changed. Build cold rather than fail.
-            if s3 cp "$OBJECT" /tmp/rust-cache."$EXT" --only-show-errors 2>/dev/null; then
-              # -P keeps absolute-ish structure predictable; extract from / since
-              # the archive stores $HOME and the workspace target by full path.
-              $TAR_X /tmp/rust-cache."$EXT" -C / 2>/dev/null || {
-                echo "cache-rust: archive would not extract — ignoring, building cold."
-                exit 0
-              }
-              rm -f /tmp/rust-cache."$EXT"
-              echo "cache-rust: restored."
-            else
-              echo "cache-rust: no cache at ${OBJECT} — cold build."
-            fi
-            ;;
-          save)
-            # Only archive paths that exist — a job that never populated target
-            # (e.g. it failed in checkout) should not error here. Indices track
-            # so PATHS and REL_PATHS stay aligned.
-            REL_EXISTING=()
-            for i in "${!PATHS[@]}"; do
-              [[ -e "${PATHS[$i]}" ]] && REL_EXISTING+=("${REL_PATHS[$i]}")
-            done
-            if [[ ${#REL_EXISTING[@]} -eq 0 ]]; then
-              echo "cache-rust: nothing to save."
-              exit 0
-            fi
-            echo "cache-rust: saving ${REL_EXISTING[*]} -> ${OBJECT}"
-            # All entries relative to /, archive extracted at / on restore.
-            # Failures here never fail the build — a missing cache is a slow
-            # build, not a broken one.
-            {
-              $TAR_C /tmp/rust-cache."$EXT" -C / "${REL_EXISTING[@]}" 2>/dev/null &&
-              s3 cp /tmp/rust-cache."$EXT" "$OBJECT" --only-show-errors
-            } || echo "cache-rust: save failed — leaving the previous cache in place."
-            rm -f /tmp/rust-cache."$EXT" || true
-            ;;
-          *)
-            echo "cache-rust: unknown phase '${PARSES_CACHE_PHASE}' (want restore|save)." >&2
-            exit 1
-            ;;
-        esac
+        # Start the server now with the config exported above, and prove it can
+        # reach MinIO. A failure here is not fatal — the wrapper still compiles,
+        # just without hits — but it should be visible, not silent.
+        export RUSTC_WRAPPER=sccache \
+          SCCACHE_BUCKET="${MINIO_BUCKET:-actions-cache}" \
+          SCCACHE_ENDPOINT="${MINIO_ENDPOINT}:${MINIO_PORT:-9000}" \
+          SCCACHE_S3_USE_SSL=false SCCACHE_S3_KEY_PREFIX="${PREFIX}" \
+          SCCACHE_REGION=us-east-1 \
+          AWS_ACCESS_KEY_ID="${MINIO_ACCESS_KEY}" \
+          AWS_SECRET_ACCESS_KEY="${MINIO_SECRET_KEY}" \
+          AWS_EC2_METADATA_DISABLED=true
+        if sccache --start-server 2>/tmp/sccache-start.log; then
+          echo "cache-rust: sccache serving from s3://${MINIO_BUCKET:-actions-cache}/${PREFIX}"
+          sccache --show-stats 2>/dev/null | grep -iE "cache location|storage" || true
+        else
+          echo "cache-rust: sccache would not start — compiling without a cache."
+          cat /tmp/sccache-start.log || true
+        fi
