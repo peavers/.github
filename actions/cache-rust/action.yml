@@ -1,0 +1,141 @@
+name: cache-rust
+description: >-
+  Restore and save the Cargo build cache to the in-cluster MinIO bucket
+  (actions-cache), using the MINIO_* credentials the runners already carry.
+
+  Replaces the GitHub-hosted Actions cache for Rust. That cache has a hard 10 GB
+  per-repo limit and evicts least-recently-used; a Rust target dir is a few GB,
+  so a couple of branches in flight push it over and the next build restores
+  nothing — an eight-minute cold clippy at random. MinIO has no such ceiling and
+  sits inside the cluster, so the transfer is local rather than a round trip to
+  GitHub.
+
+  Called twice: once with phase=restore before the build, once with phase=save
+  after (with `if: always()` so a failed build still seeds the cache). A
+  composite action cannot register a post step, which is why this is not one
+  call.
+
+inputs:
+  phase:
+    description: 'restore — before the build; save — after it.'
+    required: true
+  key:
+    description: >-
+      Names the cache slot. Jobs that compile the same way should share one (the
+      clippy+test verify jobs do); jobs that do not should differ, so a release
+      build does not restore a test profile's target dir over its own.
+    required: false
+    default: default
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        PARSES_CACHE_PHASE: ${{ inputs.phase }}
+        PARSES_CACHE_KEY: ${{ inputs.key }}
+      run: |
+        set -euo pipefail
+
+        # The credentials are injected into every runner as MINIO_* by the
+        # arc-runners `minio-cache-credentials` secret. Absent them, this is a
+        # no-op rather than a failure: a runner set that has not been wired for
+        # the cache should still build, just cold.
+        if [[ -z "${MINIO_ACCESS_KEY:-}" || -z "${MINIO_ENDPOINT:-}" ]]; then
+          echo "cache-rust: MINIO_* not present on this runner — skipping (${PARSES_CACHE_PHASE})."
+          exit 0
+        fi
+
+        export AWS_ACCESS_KEY_ID="${MINIO_ACCESS_KEY}"
+        export AWS_SECRET_ACCESS_KEY="${MINIO_SECRET_KEY}"
+        export AWS_DEFAULT_REGION="us-east-1"
+        # MinIO addresses buckets in the path, not the hostname; the CLI defaults
+        # to virtual-hosted style, which resolves bucket.minio.minio.svc and
+        # fails. And there is no EC2 metadata endpoint in the cluster, so stop
+        # the CLI probing one and stalling for its timeout.
+        export AWS_EC2_METADATA_DISABLED=true
+        aws configure set default.s3.addressing_style path
+        ENDPOINT="http://${MINIO_ENDPOINT}:${MINIO_PORT:-9000}"
+        BUCKET="${MINIO_BUCKET:-actions-cache}"
+
+        # One moving object per (repo, slot, OS). Deliberately not keyed on the
+        # lockfile: restoring the previous run's target dir even when a
+        # dependency changed is the point — cargo recompiles what differs and
+        # reuses the rest, which is the whole reason a warm target dir turns an
+        # eight-minute build into one. A lockfile-keyed object would go cold on
+        # every dependency bump, which is exactly when a build is slowest.
+        SLOT="rust/${GITHUB_REPOSITORY}/${PARSES_CACHE_KEY}/${RUNNER_OS}"
+
+        # zstd is dramatically faster than gzip on a multi-GB tree and the
+        # transfer is in-cluster, so the archive is never the bottleneck. Fall
+        # back to gzip only if the runner lacks zstd, and record which in the
+        # object name so restore reaches for the right one.
+        if command -v zstd >/dev/null 2>&1; then
+          COMP=zstd; EXT=tzst; TAR_C="tar -c --use-compress-program=zstd -f"; TAR_X="tar -x --use-compress-program=zstd -f"
+        else
+          COMP=gzip; EXT=tgz;  TAR_C="tar -cz -f"; TAR_X="tar -xz -f"
+        fi
+        OBJECT="s3://${BUCKET}/${SLOT}.${EXT}"
+
+        # The compiler's output plus the downloaded crate sources. CARGO_HOME
+        # defaults to ~/.cargo; honour an override so this keeps working if the
+        # runner image moves it.
+        #
+        # Everything is cached by absolute path and the archive is always
+        # extracted at / — GITHUB_WORKSPACE is deterministic per repo on these
+        # runners (/home/runner/_work/<repo>/<repo>), so target lands back
+        # exactly where cargo left it. Storing target relative to the workspace
+        # and cargo relative to / in one archive is the bug that puts target at
+        # /target on the way back; one root avoids it.
+        CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+        PATHS=("$CARGO_HOME_DIR/registry" "$CARGO_HOME_DIR/git" "$GITHUB_WORKSPACE/target")
+        # Same paths with the leading slash stripped, for tar -C /.
+        REL_PATHS=("${CARGO_HOME_DIR#/}/registry" "${CARGO_HOME_DIR#/}/git" "${GITHUB_WORKSPACE#/}/target")
+
+        s3() { aws --endpoint-url "$ENDPOINT" s3 "$@"; }
+
+        case "$PARSES_CACHE_PHASE" in
+          restore)
+            echo "cache-rust: restoring ${OBJECT}"
+            # A miss is ordinary — a fresh slot, or the first build after zstd
+            # changed. Build cold rather than fail.
+            if s3 cp "$OBJECT" /tmp/rust-cache."$EXT" --only-show-errors 2>/dev/null; then
+              # -P keeps absolute-ish structure predictable; extract from / since
+              # the archive stores $HOME and the workspace target by full path.
+              $TAR_X /tmp/rust-cache."$EXT" -C / 2>/dev/null || {
+                echo "cache-rust: archive would not extract — ignoring, building cold."
+                exit 0
+              }
+              rm -f /tmp/rust-cache."$EXT"
+              echo "cache-rust: restored."
+            else
+              echo "cache-rust: no cache at ${OBJECT} — cold build."
+            fi
+            ;;
+          save)
+            # Only archive paths that exist — a job that never populated target
+            # (e.g. it failed in checkout) should not error here. Indices track
+            # so PATHS and REL_PATHS stay aligned.
+            REL_EXISTING=()
+            for i in "${!PATHS[@]}"; do
+              [[ -e "${PATHS[$i]}" ]] && REL_EXISTING+=("${REL_PATHS[$i]}")
+            done
+            if [[ ${#REL_EXISTING[@]} -eq 0 ]]; then
+              echo "cache-rust: nothing to save."
+              exit 0
+            fi
+            echo "cache-rust: saving ${REL_EXISTING[*]} -> ${OBJECT}"
+            # All entries relative to /, archive extracted at / on restore.
+            # Failures here never fail the build — a missing cache is a slow
+            # build, not a broken one.
+            {
+              $TAR_C /tmp/rust-cache."$EXT" -C / "${REL_EXISTING[@]}" 2>/dev/null &&
+              s3 cp /tmp/rust-cache."$EXT" "$OBJECT" --only-show-errors
+            } || echo "cache-rust: save failed — leaving the previous cache in place."
+            rm -f /tmp/rust-cache."$EXT" || true
+            ;;
+          *)
+            echo "cache-rust: unknown phase '${PARSES_CACHE_PHASE}' (want restore|save)." >&2
+            exit 1
+            ;;
+        esac
