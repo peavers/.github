@@ -66,14 +66,19 @@ runs:
         # every dependency bump, which is exactly when a build is slowest.
         SLOT="rust/${GITHUB_REPOSITORY}/${PARSES_CACHE_KEY}/${RUNNER_OS}"
 
-        # zstd is dramatically faster than gzip on a multi-GB tree and the
-        # transfer is in-cluster, so the archive is never the bottleneck. Fall
-        # back to gzip only if the runner lacks zstd, and record which in the
-        # object name so restore reaches for the right one.
+        # zstd at its fastest level, across every core. Its default is
+        # single-threaded at level 3, which turned a multi-gigabyte target dir
+        # into a six-minute save that would eat the whole saving. Level 1 on all
+        # cores cuts that to seconds, and the transfer is in-cluster so the
+        # slightly larger archive costs nothing. These are set through zstd's own
+        # environment variables rather than tar flags, because
+        # `--use-compress-program` takes one word and any args after it would be
+        # parsed by tar instead. Fall back to gzip only if the runner lacks zstd.
+        export ZSTD_CLEVEL=1 ZSTD_NBTHREADS=0
         if command -v zstd >/dev/null 2>&1; then
-          COMP=zstd; EXT=tzst; TAR_C="tar -c --use-compress-program=zstd -f"; TAR_X="tar -x --use-compress-program=zstd -f"
+          EXT=tzst; TAR_C="tar -c --use-compress-program=zstd -f"; TAR_X="tar -x --use-compress-program=zstd -f"
         else
-          COMP=gzip; EXT=tgz;  TAR_C="tar -cz -f"; TAR_X="tar -xz -f"
+          EXT=tgz;  TAR_C="tar -cz -f"; TAR_X="tar -xz -f"
         fi
         OBJECT="s3://${BUCKET}/${SLOT}.${EXT}"
 
