@@ -1,0 +1,99 @@
+name: azure-authenticode-sign
+description: >-
+  Authenticode-sign Windows PE files (installers, exes) from a Linux runner,
+  via Azure Artifact Signing (formerly Trusted Signing). Signing happens
+  remotely in Azure — no certificate ever exists on the runner — using jsign,
+  which is what lets the in-cluster runners sign artifacts that were built on
+  GitHub-hosted Windows runners, with credentials that live in Vault and
+  never in GitHub.
+
+  Expects AZURE_TENANT_ID, AZURE_CLIENT_ID and AZURE_CLIENT_SECRET in the
+  environment (fetch them with hashicorp/vault-action from
+  kv/cluster/_shared/azure-artifact-signing). A deliberate no-op when the
+  client secret is absent, so a release pipeline keeps shipping unsigned
+  builds rather than breaking while Vault is unprovisioned.
+
+  Order matters for tauri apps: sign BEFORE `tauri signer sign` and before
+  generating latest.json — the updater signature must cover the final bytes.
+
+inputs:
+  files:
+    description: Space-separated paths/globs of PE files to sign in place.
+    required: true
+  endpoint:
+    description: Artifact Signing regional host, without scheme.
+    required: false
+    default: eus.codesigning.azure.net
+  account:
+    description: Artifact Signing account name.
+    required: true
+  profile:
+    description: Certificate profile name.
+    required: true
+
+outputs:
+  signed:
+    description: '"true" when files were signed, "false" when skipped.'
+    value: ${{ steps.sign.outputs.signed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Java for jsign
+      if: env.AZURE_CLIENT_SECRET != ''
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: "17"
+
+    - name: Authenticode sign via Azure
+      id: sign
+      shell: bash
+      env:
+        JSIGN_VERSION: "7.1"
+        JSIGN_SHA256: cfb48b07fdd2ee199bfc9e71d8dccdde67a799c4793602e446c7a101be62b3c4
+        TS_ENDPOINT: ${{ inputs.endpoint }}
+        TS_ACCOUNT: ${{ inputs.account }}
+        TS_PROFILE: ${{ inputs.profile }}
+        FILES: ${{ inputs.files }}
+      run: |
+        set -euo pipefail
+        if [ -z "${AZURE_CLIENT_SECRET:-}" ]; then
+          echo "signed=false" >> "$GITHUB_OUTPUT"
+          echo "Azure signing credentials not present — shipping unsigned."
+          exit 0
+        fi
+
+        curl -sSfL -o /tmp/jsign.jar \
+          "https://github.com/ebourg/jsign/releases/download/${JSIGN_VERSION}/jsign-${JSIGN_VERSION}.jar"
+        echo "${JSIGN_SHA256}  /tmp/jsign.jar" | sha256sum -c -
+
+        # Client-credentials token scoped to the signing service. Short-lived
+        # and never persisted; the private key itself never leaves Azure.
+        TOKEN=$(curl -sSf -X POST \
+          "https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token" \
+          -d "grant_type=client_credentials" \
+          -d "client_id=${AZURE_CLIENT_ID}" \
+          --data-urlencode "client_secret=${AZURE_CLIENT_SECRET}" \
+          --data-urlencode "scope=https://codesigning.azure.net/.default" \
+          | jq -r .access_token)
+
+        signed_any=false
+        for f in $FILES; do
+          [ -e "$f" ] || continue
+          java -jar /tmp/jsign.jar \
+            --storetype TRUSTEDSIGNING \
+            --keystore "$TS_ENDPOINT" \
+            --storepass "$TOKEN" \
+            --alias "${TS_ACCOUNT}/${TS_PROFILE}" \
+            --tsaurl http://timestamp.acs.microsoft.com \
+            --tsmode RFC3161 \
+            "$f"
+          signed_any=true
+        done
+
+        if [ "$signed_any" = "false" ]; then
+          echo "no files matched '${FILES}' — nothing signed" >&2
+          exit 1
+        fi
+        echo "signed=true" >> "$GITHUB_OUTPUT"
