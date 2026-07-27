@@ -297,15 +297,34 @@ jobs:
 
             const latest = { version: VERSION, notes: `${PRODUCT} v${VERSION}`, pub_date: new Date().toISOString(), platforms: {} };
 
-            for (const asset of assets) {
+            // Map a filename to Tauri updater platform keys. macOS with no arch
+            // marker is a universal bundle → both darwin keys.
+            const platformsFor = (n) => {
+              if (n.endsWith('.dmg') || n.endsWith('.app.tar.gz')) {
+                if (n.includes('aarch64') || n.includes('arm64')) return ['darwin-aarch64'];
+                if (n.includes('x64') || n.includes('x86_64') || n.includes('intel')) return ['darwin-x86_64'];
+                return ['darwin-aarch64', 'darwin-x86_64'];
+              }
+              if (n.endsWith('.deb') || n.endsWith('.appimage') || n.endsWith('.appimage.tar.gz')) return ['linux-x86_64'];
+              if (n.endsWith('.msi') || n.endsWith('-setup.exe')) return ['windows-x86_64'];
+              return [];
+            };
+            // Prefer the true updater artifact when several map to one platform:
+            // .app.tar.gz over .dmg for macOS; the versioned installer over any
+            // stable-named copy. Lower rank wins (processed first).
+            const rank = (n) => n.endsWith('.app.tar.gz') ? 0
+              : (n.endsWith('.msi') || n.endsWith('-setup.exe')) ? 1
+              : (n.endsWith('.appimage') || n.endsWith('.appimage.tar.gz')) ? 2
+              : n.endsWith('.deb') ? 3 : n.endsWith('.dmg') ? 4 : 9;
+
+            const bundles = assets
+              .filter(a => !a.name.toLowerCase().endsWith('.sig') && a.name !== 'latest.json')
+              .sort((a, b) => rank(a.name.toLowerCase()) - rank(b.name.toLowerCase()));
+
+            for (const asset of bundles) {
               const n = asset.name.toLowerCase();
-              if (n.endsWith('.sig') || n === 'latest.json') continue;
-              let platform = null;
-              if ((n.includes('aarch64') || n.includes('arm64') || n.includes('apple')) && (n.endsWith('.dmg') || n.endsWith('.app.tar.gz'))) platform = 'darwin-aarch64';
-              else if ((n.includes('x64') || n.includes('x86_64')) && (n.endsWith('.dmg') || n.endsWith('.app.tar.gz'))) platform = 'darwin-x86_64';
-              else if (n.endsWith('.deb') || n.endsWith('.appimage') || n.endsWith('.appimage.tar.gz')) platform = 'linux-x86_64';
-              else if (n.endsWith('.msi') || n.endsWith('-setup.exe')) platform = 'windows-x86_64';
-              if (!platform) { console.log(`  no platform for ${asset.name}`); continue; }
+              const platforms = platformsFor(n);
+              if (platforms.length === 0) { console.log(`  no platform for ${asset.name}`); continue; }
 
               const sig = assets.find(a => a.name === asset.name + '.sig');
               const cfg = { url: asset.browser_download_url };
@@ -314,11 +333,11 @@ jobs:
                 if (res.ok) cfg.signature = (await res.text()).trim();
                 else console.log(`  could not fetch sig for ${asset.name}`);
               }
-              // First artifact wins per platform: the versioned installer sorts
-              // before any stable-named copy, so the signed one is kept.
-              if (!latest.platforms[platform]) {
-                latest.platforms[platform] = cfg;
-                console.log(`  ${asset.name} -> ${platform}${cfg.signature ? ' (signed)' : ''}`);
+              for (const p of platforms) {
+                if (!latest.platforms[p]) {
+                  latest.platforms[p] = cfg;
+                  console.log(`  ${asset.name} -> ${p}${cfg.signature ? ' (signed)' : ''}`);
+                }
               }
             }
 
