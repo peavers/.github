@@ -154,15 +154,25 @@ jobs:
             echo "No updater key available — leaving .sig files as built."
             exit 0
           fi
-          # Re-sign exactly the updater artifacts: any bundle the build produced
-          # a sibling .sig for (Windows installer, macOS .app.tar.gz, etc). The
-          # build signs with a throwaway/pre-Authenticode key; this overwrites
-          # each .sig with one made by the real key over the shipped bytes.
+          # Sign the updater artifacts with the real key over the shipped bytes.
+          # Two sources, unioned and de-duped:
+          #   (a) the Windows installer(s) — always updater artifacts, and the
+          #       Authenticode step just changed their bytes. Some apps collect
+          #       only the installer (no build-time .sig), so this also CREATES
+          #       the .sig rather than only refreshing it.
+          #   (b) anything the build already produced a sibling .sig for
+          #       (macOS .app.tar.gz/.dmg, etc), signed with a throwaway key.
           shopt -s nullglob
+          declare -A targets
+          for f in ${{ inputs.windows-installer-glob }}; do
+            [ -f "$f" ] && targets["$f"]=1
+          done
           for f in dist/*; do
             [ -f "$f" ] || continue
             case "$f" in *.sig) continue;; esac
-            [ -e "$f.sig" ] || continue
+            [ -e "$f.sig" ] && targets["$f"]=1
+          done
+          for f in "${!targets[@]}"; do
             echo "re-signing $f"
             npx --yes @tauri-apps/cli@^2 signer sign "$f"
           done
