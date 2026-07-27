@@ -164,9 +164,14 @@ jobs:
           #       (macOS .app.tar.gz/.dmg, etc), signed with a throwaway key.
           shopt -s nullglob
           declare -A targets
-          for f in ${{ inputs.windows-installer-glob }}; do
+          # Canonical updater artifacts, signed even when the build collected
+          # no .sig (some apps ship only the bundle): Windows installers plus
+          # the macOS/Linux updater tarballs.
+          for f in ${{ inputs.windows-installer-glob }} dist/*.app.tar.gz dist/*.AppImage.tar.gz; do
             [ -f "$f" ] && targets["$f"]=1
           done
+          # Anything the build already produced a sibling .sig for (e.g. a
+          # .dmg an app signs directly), refreshed over the shipped bytes.
           for f in dist/*; do
             [ -f "$f" ] || continue
             case "$f" in *.sig) continue;; esac
