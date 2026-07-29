@@ -55,6 +55,21 @@ on:
           name, giving a permanent releases/latest/download/<name> link.
         type: string
         default: ""
+      runner:
+        description: >-
+          The in-cluster runner pool to publish from. Self-hosted runners are
+          scoped to the org that registered them, so a caller outside
+          peavers-code cannot claim the default and MUST pass its own pool —
+          parses-gg/parses-desktop passes parses-gg-runners.
+
+          Getting this wrong does not fail the job, which is the whole reason it
+          is an input: an unclaimable label leaves the run queued at "Waiting for
+          a runner to pick up this job..." until it times out hours later, having
+          published nothing and reported no error. Any pool works provided it can
+          reach Vault at vault.vault.svc.cluster.local, which every in-cluster
+          pool can and no GitHub-hosted runner can.
+        type: string
+        default: peavers-code-runners
     secrets:
       # Used only when updater-key-vault-path is empty (apps that keep the key
       # as a GitHub secret rather than in Vault).
@@ -65,7 +80,7 @@ on:
 
 jobs:
   publish:
-    runs-on: peavers-code-runners
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
       id-token: write # Vault OIDC
