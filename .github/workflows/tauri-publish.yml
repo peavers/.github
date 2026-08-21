@@ -14,8 +14,13 @@ name: tauri-publish
 #      covers the final bytes. Builds use a throwaway updater key (or, for
 #      apps that sign at build time, a key that predates Authenticode), so this
 #      step is what makes auto-update actually verify.
-#   3. Create the release, upload assets, publish.
-#   4. Write latest.json from the published assets.
+#   3. Create the release as a draft and upload the assets.
+#   4. Write latest.json into the draft, from the bundles on disk.
+#   5. Publish. This is the only step that makes any of it visible, and it is
+#      last because `releases/latest/download/latest.json` — the endpoint every
+#      installed client polls — starts resolving here. Writing the manifest
+#      after this point leaves that URL 404ing in between, which clients report
+#      as "Could not fetch a valid release JSON from the remote".
 # Missing Azure creds -> the sign step no-ops and the release ships unsigned;
 # missing updater key -> .sig files are left as-is.
 
@@ -274,23 +279,23 @@ jobs:
               }
             }
 
-      - name: Publish release
-        uses: actions/github-script@v7
-        env:
-          PUBLIC_OWNER: ${{ inputs.public-owner }}
-          PUBLIC_NAME: ${{ inputs.public-name }}
-          RELEASE_ID: ${{ steps.create.outputs.release_id }}
-        with:
-          github-token: ${{ steps.ghtoken.outputs.token }}
-          script: |
-            const { PUBLIC_OWNER, PUBLIC_NAME, RELEASE_ID } = process.env;
-            await github.rest.repos.updateRelease({
-              owner: PUBLIC_OWNER, repo: PUBLIC_NAME, release_id: parseInt(RELEASE_ID),
-              draft: false, prerelease: false,
-            });
-            console.log('Published release');
-
-      - name: Generate and upload latest.json
+      # Written while the release is still a draft, and deliberately so.
+      #
+      # `releases/latest/download/latest.json` is the endpoint compiled into
+      # every installed client. GitHub points `latest` at a release the moment
+      # it stops being a draft, so publishing first and writing the manifest
+      # after leaves a window in which that URL 404s — and a 404 from its only
+      # endpoint is what tauri-plugin-updater reports as "Could not fetch a
+      # valid release JSON from the remote". Measured at 13 seconds on Parses
+      # v0.1.30, which is 13 seconds in which every client on earth that checks
+      # is told updates are broken.
+      #
+      # A draft is invisible to `latest`, so with this order clients keep
+      # reading the previous release's manifest until the new one is complete,
+      # and the switch is a single atomic step. It also means a run that dies
+      # partway leaves the last good release standing rather than a public one
+      # with no manifest.
+      - name: Generate latest.json and add it to the draft
         uses: actions/github-script@v7
         env:
           PRODUCT: ${{ inputs.product-name }}
@@ -301,14 +306,19 @@ jobs:
         with:
           github-token: ${{ steps.ghtoken.outputs.token }}
           script: |
+            const fs = require('fs');
+            const path = require('path');
             const { PRODUCT, VERSION, PUBLIC_OWNER, PUBLIC_NAME, RELEASE_ID } = process.env;
-            // Assets are eventually-consistent right after upload.
-            await new Promise(r => setTimeout(r, 10000));
-            const release = await github.rest.repos.getRelease({
-              owner: PUBLIC_OWNER, repo: PUBLIC_NAME, release_id: parseInt(RELEASE_ID),
-            });
-            const assets = release.data.assets;
-            console.log('Assets:', assets.map(a => a.name).join(', '));
+
+            // Read the bundles off the runner rather than back out of the API.
+            // dist/ is exactly what the upload step just sent, it needs no
+            // wait for the API to become consistent, and — the reason this
+            // step can run before publishing at all — a draft release's assets
+            // are not downloadable over the public URL. The signatures are
+            // sitting right here next to the files they cover.
+            const dir = 'dist';
+            const names = fs.readdirSync(dir).filter(f => fs.statSync(path.join(dir, f)).isFile());
+            console.log('Bundles:', names.join(', '));
 
             const latest = { version: VERSION, notes: `${PRODUCT} v${VERSION}`, pub_date: new Date().toISOString(), platforms: {} };
 
@@ -332,26 +342,30 @@ jobs:
               : (n.endsWith('.appimage') || n.endsWith('.appimage.tar.gz')) ? 2
               : n.endsWith('.deb') ? 3 : n.endsWith('.dmg') ? 4 : 9;
 
-            const bundles = assets
-              .filter(a => !a.name.toLowerCase().endsWith('.sig') && a.name !== 'latest.json')
-              .sort((a, b) => rank(a.name.toLowerCase()) - rank(b.name.toLowerCase()));
+            const bundles = names
+              .filter(n => !n.toLowerCase().endsWith('.sig') && n !== 'latest.json')
+              .sort((a, b) => rank(a.toLowerCase()) - rank(b.toLowerCase()));
 
-            for (const asset of bundles) {
-              const n = asset.name.toLowerCase();
+            for (const name of bundles) {
+              const n = name.toLowerCase();
               const platforms = platformsFor(n);
-              if (platforms.length === 0) { console.log(`  no platform for ${asset.name}`); continue; }
+              if (platforms.length === 0) { console.log(`  no platform for ${name}`); continue; }
 
-              const sig = assets.find(a => a.name === asset.name + '.sig');
-              const cfg = { url: asset.browser_download_url };
-              if (sig) {
-                const res = await fetch(sig.browser_download_url);
-                if (res.ok) cfg.signature = (await res.text()).trim();
-                else console.log(`  could not fetch sig for ${asset.name}`);
-              }
+              // Spelled out rather than read from the asset's
+              // browser_download_url, which for a draft can carry an
+              // `untagged-...` placeholder instead of the tag. This is the URL
+              // the asset answers on once the release below goes public.
+              const cfg = {
+                url: `https://github.com/${PUBLIC_OWNER}/${PUBLIC_NAME}/releases/download/v${VERSION}/${encodeURIComponent(name)}`,
+              };
+              const sig = path.join(dir, name + '.sig');
+              if (fs.existsSync(sig)) cfg.signature = fs.readFileSync(sig, 'utf8').trim();
+              else console.log(`  no sig alongside ${name}`);
+
               for (const p of platforms) {
                 if (!latest.platforms[p]) {
                   latest.platforms[p] = cfg;
-                  console.log(`  ${asset.name} -> ${p}${cfg.signature ? ' (signed)' : ''}`);
+                  console.log(`  ${name} -> ${p}${cfg.signature ? ' (signed)' : ''}`);
                 }
               }
             }
@@ -361,7 +375,14 @@ jobs:
             }
             const content = JSON.stringify(latest, null, 2);
             console.log(content);
-            const existing = assets.find(a => a.name === 'latest.json');
+            // The reuse path (a re-run against an existing release) can find
+            // one already there. Safe to delete now only because the release
+            // is still a draft; doing it after publishing is what left a
+            // public release momentarily without a manifest.
+            const release = await github.rest.repos.getRelease({
+              owner: PUBLIC_OWNER, repo: PUBLIC_NAME, release_id: parseInt(RELEASE_ID),
+            });
+            const existing = release.data.assets.find(a => a.name === 'latest.json');
             if (existing) await github.rest.repos.deleteReleaseAsset({ owner: PUBLIC_OWNER, repo: PUBLIC_NAME, asset_id: existing.id });
             await github.rest.repos.uploadReleaseAsset({
               owner: PUBLIC_OWNER, repo: PUBLIC_NAME, release_id: parseInt(RELEASE_ID),
@@ -369,3 +390,22 @@ jobs:
               headers: { 'content-type': 'application/json', 'content-length': content.length },
             });
             console.log('Uploaded latest.json');
+
+      # Last, and last for a reason: this is the single step that makes the new
+      # version visible to every installed client, and by here the release is
+      # complete.
+      - name: Publish release
+        uses: actions/github-script@v7
+        env:
+          PUBLIC_OWNER: ${{ inputs.public-owner }}
+          PUBLIC_NAME: ${{ inputs.public-name }}
+          RELEASE_ID: ${{ steps.create.outputs.release_id }}
+        with:
+          github-token: ${{ steps.ghtoken.outputs.token }}
+          script: |
+            const { PUBLIC_OWNER, PUBLIC_NAME, RELEASE_ID } = process.env;
+            await github.rest.repos.updateRelease({
+              owner: PUBLIC_OWNER, repo: PUBLIC_NAME, release_id: parseInt(RELEASE_ID),
+              draft: false, prerelease: false,
+            });
+            console.log('Published release');
