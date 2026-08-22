@@ -55,7 +55,7 @@ runs:
       env:
         EXPLICIT: ${{ inputs.vault-url }}
         IN_CLUSTER: https://vault.vault.svc.cluster.local:8200
-        VIA_TUNNEL: https://vault-ci.parses.gg
+        VIA_TUNNEL: https://vault-ci.valhalla.life
       run: |
         set -euo pipefail
         if [ -n "${EXPLICIT}" ]; then

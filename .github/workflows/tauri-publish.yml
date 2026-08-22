@@ -66,7 +66,7 @@ on:
           is an input: an unclaimable label leaves the run queued at "Waiting for
           a runner to pick up this job..." until it times out hours later, having
           published nothing and reported no error. Any pool works now: Vault is
-          reached at vault-ci.parses.gg, which resolves from anywhere, so this is
+          reached at vault-ci.valhalla.life, which resolves from anywhere, so this is
           no longer restricted to the in-cluster pools.
         type: string
         default: peavers-code-runners
@@ -105,7 +105,7 @@ jobs:
           # has moved its runner still reaches Vault. Cloudflare terminates a real
           # certificate here, which is why verification is on - the cluster
           # service serves a private CA and needed it skipped.
-          url: https://vault-ci.parses.gg
+          url: https://vault-ci.valhalla.life
           method: jwt
           path: jwt-github
           role: ci
@@ -126,7 +126,7 @@ jobs:
           # has moved its runner still reaches Vault. Cloudflare terminates a real
           # certificate here, which is why verification is on - the cluster
           # service serves a private CA and needed it skipped.
-          url: https://vault-ci.parses.gg
+          url: https://vault-ci.valhalla.life
           method: jwt
           path: jwt-github
           role: ci
