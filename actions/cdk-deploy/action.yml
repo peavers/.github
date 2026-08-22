@@ -82,7 +82,6 @@ runs:
         path: jwt-github
         role: ci
         jwtGithubAudience: https://vault.internal
-        tlsSkipVerify: true
         exportToken: false
         secrets: |
           kv/data/cluster/_shared/cloudflare-dns api_token | CLOUDFLARE_API_TOKEN
