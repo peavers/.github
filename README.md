@@ -102,9 +102,14 @@ the pods still mount them a broken call here would be invisible - the old file i
 still on disk and the build still passes. A job green under `strict` is proven not
 to need the mounts.
 
-`vault-url` is the one line that changes when CI moves off the cluster and reaches
-Vault through the tunnel instead. Set `vault-tls-skip-verify: false` in the same
-change: it is true today only because Vault serves a private CA in-cluster.
+**It finds Vault by itself.** The action probes the in-cluster service and falls
+back to the tunnel hostname when there is no route to it, so the same workflow
+works on an in-cluster runner and on an external one with no configuration.
+
+TLS verification is *derived* from which one answered - private CA in-cluster,
+publicly trusted certificate through the tunnel. That is deliberate: it removes
+the failure where somebody repoints the URL and leaves verification off against a
+public endpoint, which nothing anywhere would report.
 
 ### `actions/compute-version` — immutable image tag
 
