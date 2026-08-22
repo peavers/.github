@@ -71,29 +71,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Fetch Harbor credentials from Vault
-        uses: hashicorp/vault-action@v3
+      # Harbor credentials and the route to Harbor. In-cluster that is the
+      # registry directly; anywhere else this opens the CI tunnel.
+      - uses: peavers/.github/actions/valhalla-auth@main
+        id: auth
         with:
-          # The tunnel hostname rather than the cluster service, so a caller that
-          # has moved its runner still reaches Vault. Cloudflare terminates a real
-          # certificate here, which is why verification is on - the cluster
-          # service serves a private CA and needed it skipped.
-          url: https://vault-ci.valhalla.life
-          method: jwt
-          path: jwt-github
-          role: ci
-          jwtGithubAudience: https://vault.internal
-          exportToken: false
-          secrets: |
-            kv/data/cluster/_shared/harbor username | HARBOR_USERNAME ;
-            kv/data/cluster/_shared/harbor password | HARBOR_PASSWORD
-
-      - name: Log in to Harbor
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ inputs.registry }}
-          username: ${{ env.HARBOR_USERNAME }}
-          password: ${{ env.HARBOR_PASSWORD }}
+          harbor: true
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -101,6 +84,42 @@ jobs:
       - name: Compute version
         id: version
         uses: peavers/.github/actions/compute-version@main
+
+      # Where this actually pushes. The caller names its image with a registry
+      # host - docker.valhalla.life/peavers/x - and that host only takes a
+      # >100 MB layer over the LAN. valhalla-auth reports where the registry is
+      # reachable from *this* runner, so the host is replaced and the repository
+      # path kept. Harbor stores by path, so the cluster pulls the same image
+      # either way.
+      - name: Resolve where to push
+        id: target
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          REGISTRY: ${{ steps.auth.outputs.registry }}
+          DECLARED: ${{ inputs.registry }}
+        run: |
+          set -euo pipefail
+          first="${IMAGE%%/*}"
+          # Only re-host an image that names THIS workflow's registry. A caller
+          # pushing somewhere else entirely - ghcr.io, a public registry - must
+          # come out unchanged, or it would be silently redirected into Harbor.
+          if [ "$first" = "$DECLARED" ]; then
+            path="${IMAGE#*/}"
+          else
+            echo "image=${IMAGE}"    >> "$GITHUB_OUTPUT"
+            echo "insecure=false"    >> "$GITHUB_OUTPUT"
+            echo "not $DECLARED - leaving ${IMAGE} alone"
+            exit 0
+          fi
+          echo "image=${REGISTRY}/${path}" >> "$GITHUB_OUTPUT"
+          # A loopback target is the tunnel listener, which speaks plain HTTP.
+          # Docker trusts 127.0.0.1 without being told; jib does not.
+          case "$REGISTRY" in
+            127.0.0.1:*|localhost:*) echo "insecure=true"  >> "$GITHUB_OUTPUT" ;;
+            *)                       echo "insecure=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "pushing to ${REGISTRY}/${path}"
 
       - name: Build & push image
         uses: docker/build-push-action@v6
@@ -110,5 +129,5 @@ jobs:
           platforms: ${{ inputs.platforms }}
           push: true
           tags: |
-            ${{ inputs.image }}:latest
-            ${{ inputs.image }}:${{ steps.version.outputs.version }}
+            ${{ steps.target.outputs.image }}:latest
+            ${{ steps.target.outputs.image }}:${{ steps.version.outputs.version }}
