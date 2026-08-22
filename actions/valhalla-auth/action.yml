@@ -79,6 +79,16 @@ inputs:
     required: false
     default: ""
 
+outputs:
+  registry:
+    description: >-
+      Where to push images. `docker.valhalla.life` from inside the cluster, or a
+      loopback address fronting the tunnel from outside. Tag and push with this
+      rather than a literal, and the same workflow works on either runner.
+      The repository path is what Harbor stores, so the cluster still pulls
+      `docker.valhalla.life/...` either way.
+    value: ${{ steps.registry.outputs.host }}
+
 runs:
   using: composite
   steps:
@@ -120,6 +130,9 @@ runs:
         esac
         echo "url=$url"   >> "$GITHUB_OUTPUT"
         echo "skip=$skip" >> "$GITHUB_OUTPUT"
+        # Everything else keys off this. "Inside the cluster" is not a guess -
+        # it is whether the cluster service just answered.
+        echo "in_cluster=$skip" >> "$GITHUB_OUTPUT"
         echo "vault: $url (tlsSkipVerify=$skip)"
 
     # Fail early and in the workflow's own words. vault-action's error for an
@@ -170,11 +183,84 @@ runs:
           kv/data/cluster/_shared/harbor username | HARBOR_USERNAME ;
           kv/data/cluster/_shared/harbor password | HARBOR_PASSWORD
 
+    # Reaching Harbor from outside the cluster.
+    #
+    # Cloudflare's HTTP proxy caps a request body at 100 MB and several images
+    # here have a single layer well past that, so the in-cluster runners bypass
+    # Cloudflare entirely with hostAliases + network=host. An external runner
+    # cannot. A TCP route is not subject to the cap - measured, 600 MB passes
+    # where 120 MB gets a 413 over HTTP - so that is what this opens.
+    #
+    # Docker trusts 127.0.0.1 as an insecure registry with no daemon config, and
+    # Harbor stores by repository path, so an image pushed to the loopback
+    # address is the same artifact the cluster pulls as docker.valhalla.life.
+    - name: Cloudflare Access token for the registry tunnel
+      id: cfaccess
+      if: inputs.harbor == 'true' && steps.vault.outputs.in_cluster != 'true'
+      uses: hashicorp/vault-action@v3
+      with:
+        url: ${{ steps.vault.outputs.url }}
+        method: jwt
+        path: jwt-github
+        role: ci
+        jwtGithubAudience: https://vault.internal
+        tlsSkipVerify: ${{ steps.vault.outputs.skip }}
+        exportToken: false
+        secrets: |
+          kv/data/cluster/_shared/cloudflare-ci-access client_id | CF_ACCESS_CLIENT_ID ;
+          kv/data/cluster/_shared/cloudflare-ci-access client_secret | CF_ACCESS_CLIENT_SECRET
+
+    - name: Decide the registry address
+      id: registry
+      if: inputs.harbor == 'true'
+      shell: bash
+      env:
+        IN_CLUSTER: ${{ steps.vault.outputs.in_cluster }}
+        CF_ID: ${{ steps.cfaccess.outputs.cf_access_client_id }}
+        CF_SECRET: ${{ steps.cfaccess.outputs.cf_access_client_secret }}
+      run: |
+        set -euo pipefail
+        if [ "$IN_CLUSTER" = true ]; then
+          echo "host=docker.valhalla.life" >> "$GITHUB_OUTPUT"
+          echo "harbor: in-cluster, pushing straight at it"
+          exit 0
+        fi
+        if [ -z "${CF_ID:-}" ] || [ -z "${CF_SECRET:-}" ]; then
+          echo "::error::no Cloudflare Access token, so there is no route to Harbor from here."
+          exit 1
+        fi
+        if ! command -v cloudflared >/dev/null 2>&1; then
+          arch="$(uname -m)"; case "$arch" in
+            x86_64) a=amd64 ;; aarch64|arm64) a=arm64 ;;
+            *) echo "::error::no cloudflared build for ${arch}"; exit 1 ;;
+          esac
+          curl -fsSL -o /tmp/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${a}"
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+        fi
+        nohup cloudflared access tcp \
+          --hostname registry-ci.parses.gg --url 127.0.0.1:5000 \
+          --service-token-id "$CF_ID" --service-token-secret "$CF_SECRET" \
+          > /tmp/cloudflared-registry.log 2>&1 &
+        # Wait for the listener rather than sleeping a guess - a docker login
+        # against a port that is not up yet fails in a way that reads like bad
+        # credentials.
+        for i in $(seq 1 30); do
+          if curl -s -o /dev/null --max-time 2 http://127.0.0.1:5000/v2/; then break; fi
+          sleep 1
+        done
+        if ! curl -s -o /dev/null --max-time 3 http://127.0.0.1:5000/v2/; then
+          echo "::error::the registry tunnel did not come up."; cat /tmp/cloudflared-registry.log; exit 1
+        fi
+        echo "host=127.0.0.1:5000" >> "$GITHUB_OUTPUT"
+        echo "harbor: reachable on 127.0.0.1:5000 through the CI tunnel"
+
     - name: Log in to Harbor
       if: inputs.harbor == 'true'
       uses: docker/login-action@v3
       with:
-        registry: docker.valhalla.life
+        registry: ${{ steps.registry.outputs.host }}
         # vault-action names its outputs after the env var each secret maps to,
         # LOWERCASED. Used here rather than the env context because a composite
         # action's `with:` is evaluated before the previous step's GITHUB_ENV is
