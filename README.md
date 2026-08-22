@@ -9,6 +9,7 @@ orgs (this repo is public, so cross-org references need no extra config).
 ```
 actions/                 composite actions  ->  uses: peavers/.github/actions/<name>@main
   gh-app-token/          mint a GitHub App token via Vault OIDC (PAT replacement)
+  valhalla-auth/         fetch Harbor / Nexus credentials from Vault at run time
   compute-version/       derive an immutable image tag (semver / 7-char SHA)
 .github/
   workflows/             reusable workflows ->  uses: peavers/.github/.github/workflows/<file>@main
@@ -70,6 +71,40 @@ Notes:
   not) — usually the whole reason a PAT was there.
 - Need `packages:write` / `pull-requests:write` etc.? Grant it on the **GitHub
   App**; the installation token inherits the App's permissions.
+
+### `actions/valhalla-auth` — home-lab credentials, at run time
+
+The self-hosted runner pods used to mount `~/.docker/config.json`,
+`~/.m2/settings.xml` + `NEXUS_PASSWORD` and `~/.kube/config` into every job.
+Workflows used them without declaring them, so no repo recorded the dependency
+and no job could run anywhere but in-cluster.
+
+This fetches only what a job asks for, through the same OIDC exchange
+`gh-app-token` uses. The `with:` block becomes an accurate statement of what the
+job can reach.
+
+```yaml
+permissions:
+  id-token: write          # required - the OIDC token is the only credential
+  contents: read
+
+steps:
+  - uses: peavers/.github/actions/valhalla-auth@main
+    with:
+      harbor: true         # docker login docker.valhalla.life
+      cargo: true          # CARGO_REGISTRIES_VALHALLA_TOKEN
+      maven: true          # ~/.m2/settings.xml + NEXUS_USERNAME/PASSWORD
+      npm: true            # ~/.npmrc for the @parses scope
+```
+
+`strict` defaults to **true** and deletes the runner-mounted copies first. While
+the pods still mount them a broken call here would be invisible - the old file is
+still on disk and the build still passes. A job green under `strict` is proven not
+to need the mounts.
+
+`vault-url` is the one line that changes when CI moves off the cluster and reaches
+Vault through the tunnel instead. Set `vault-tls-skip-verify: false` in the same
+change: it is true today only because Vault serves a private CA in-cluster.
 
 ### `actions/compute-version` — immutable image tag
 
