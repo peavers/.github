@@ -71,23 +71,57 @@ inputs:
     default: "true"
   vault-url:
     description: >-
-      Vault address. The in-cluster service by default. This is the single line
-      that changes when CI moves to an external runner and reaches Vault through
-      the tunnel instead - which is why every workflow takes it from here rather
-      than spelling it out.
+      Override the Vault address. Leave empty and the action probes: the
+      in-cluster service if it answers, the tunnel hostname otherwise - which is
+      what lets a job move to an external runner without editing anything here or
+      in the calling workflow. TLS verification is derived from the answer, so it
+      cannot be left off against a public certificate by accident.
     required: false
-    default: https://vault.vault.svc.cluster.local:8200
-  vault-tls-skip-verify:
-    description: >-
-      Vault serves a private CA in-cluster, so this is true today. It MUST become
-      false the moment vault-url points at a public hostname with a real
-      certificate - a skipped verification on a public endpoint is worth nothing.
-    required: false
-    default: "true"
+    default: ""
 
 runs:
   using: composite
   steps:
+    # Where Vault is, decided at run time rather than per workflow.
+    #
+    # The in-cluster address only resolves inside the cluster, and the tunnel
+    # hostname works from anywhere - so probing which one answers is what lets a
+    # repo move to an external runner by setting a variable, with no edit here or
+    # in the calling workflow.
+    #
+    # tlsSkipVerify is DERIVED from the answer, and that is the point. Vault
+    # serves a private CA in-cluster and a publicly trusted certificate through
+    # the tunnel, so "skip verification" is exactly "we are talking to the
+    # cluster service". Tying them together removes the failure where someone
+    # repoints the URL and leaves verification off against a public endpoint,
+    # which nothing would report.
+    - name: Resolve the Vault address
+      id: vault
+      shell: bash
+      env:
+        EXPLICIT: ${{ inputs.vault-url }}
+        IN_CLUSTER: https://vault.vault.svc.cluster.local:8200
+        VIA_TUNNEL: https://vault-ci.parses.gg
+      run: |
+        set -euo pipefail
+        if [ -n "${EXPLICIT}" ]; then
+          url="${EXPLICIT}"
+          echo "vault: using the address this workflow asked for"
+        elif curl -fsk --max-time 5 "${IN_CLUSTER}/v1/sys/health?standbyok=true" >/dev/null 2>&1; then
+          url="${IN_CLUSTER}"
+          echo "vault: in-cluster service answered - using it"
+        else
+          url="${VIA_TUNNEL}"
+          echo "vault: no route to the cluster service - using the tunnel"
+        fi
+        case "$url" in
+          *.svc.cluster.local*) skip=true  ;;   # private CA, only valid inside
+          *)                    skip=false ;;   # public certificate, verify it
+        esac
+        echo "url=$url"   >> "$GITHUB_OUTPUT"
+        echo "skip=$skip" >> "$GITHUB_OUTPUT"
+        echo "vault: $url (tlsSkipVerify=$skip)"
+
     # Fail early and in the workflow's own words. vault-action's error for an
     # unreadable path is a 403 with a Vault path in it, which reads like a Vault
     # outage rather than "this action was called with nothing to do".
@@ -125,12 +159,12 @@ runs:
       if: inputs.harbor == 'true'
       uses: hashicorp/vault-action@v3
       with:
-        url: ${{ inputs.vault-url }}
+        url: ${{ steps.vault.outputs.url }}
         method: jwt
         path: jwt-github
         role: ci
         jwtGithubAudience: https://vault.internal
-        tlsSkipVerify: ${{ inputs.vault-tls-skip-verify }}
+        tlsSkipVerify: ${{ steps.vault.outputs.skip }}
         exportToken: false
         secrets: |
           kv/data/cluster/_shared/harbor username | HARBOR_USERNAME ;
@@ -154,12 +188,12 @@ runs:
       if: inputs.maven == 'true' || inputs.cargo == 'true'
       uses: hashicorp/vault-action@v3
       with:
-        url: ${{ inputs.vault-url }}
+        url: ${{ steps.vault.outputs.url }}
         method: jwt
         path: jwt-github
         role: ci
         jwtGithubAudience: https://vault.internal
-        tlsSkipVerify: ${{ inputs.vault-tls-skip-verify }}
+        tlsSkipVerify: ${{ steps.vault.outputs.skip }}
         exportToken: false
         secrets: |
           kv/data/cluster/_shared/nexus-runners username | NEXUS_USERNAME ;
@@ -223,12 +257,12 @@ runs:
       if: inputs.npm == 'true'
       uses: hashicorp/vault-action@v3
       with:
-        url: ${{ inputs.vault-url }}
+        url: ${{ steps.vault.outputs.url }}
         method: jwt
         path: jwt-github
         role: ci
         jwtGithubAudience: https://vault.internal
-        tlsSkipVerify: ${{ inputs.vault-tls-skip-verify }}
+        tlsSkipVerify: ${{ steps.vault.outputs.skip }}
         exportToken: false
         secrets: |
           kv/data/cluster/_shared/nexus-npm auth | NEXUS_NPM_AUTH
