@@ -92,7 +92,7 @@ jobs:
           # has moved its runner still reaches Vault. Cloudflare terminates a real
           # certificate here, which is why verification is on - the cluster
           # service serves a private CA and needed it skipped.
-          url: https://vault-ci.parses.gg
+          url: https://vault-ci.valhalla.life
           method: jwt
           path: jwt-github
           role: ci
@@ -117,7 +117,7 @@ jobs:
           # has moved its runner still reaches Vault. Cloudflare terminates a real
           # certificate here, which is why verification is on - the cluster
           # service serves a private CA and needed it skipped.
-          url: https://vault-ci.parses.gg
+          url: https://vault-ci.valhalla.life
           method: jwt
           path: jwt-github
           role: ci

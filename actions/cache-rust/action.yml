@@ -60,7 +60,7 @@ runs:
       if: steps.cache.outputs.in_cluster != 'true'
       uses: hashicorp/vault-action@v3
       with:
-        url: https://vault-ci.parses.gg
+        url: https://vault-ci.valhalla.life
         method: jwt
         path: jwt-github
         role: ci
@@ -87,7 +87,7 @@ runs:
           chmod +x /tmp/cloudflared && sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
         fi
         nohup cloudflared access tcp \
-          --hostname cache-ci.parses.gg --url 127.0.0.1:9000 \
+          --hostname cache-ci.valhalla.life --url 127.0.0.1:9000 \
           --service-token-id "$CF_ACCESS_CLIENT_ID" \
           --service-token-secret "$CF_ACCESS_CLIENT_SECRET" \
           > /tmp/cloudflared-cache.log 2>&1 &
