@@ -1,0 +1,170 @@
+name: Harbor login
+description: >-
+  Get a route to Harbor from wherever this runner is, and log docker in to it.
+  In-cluster that is the registry directly; anywhere else it opens the CI
+  tunnel and points docker.valhalla.life at it, terminating TLS locally.
+
+  The `registry` output is the SAME value either way, so a caller never has to
+  know which kind of runner it is on. Tag and push with it rather than a
+  literal: a literal goes over the public HTTP edge, which caps request bodies
+  at 100 MB, and parses-render already has a 282.5 MB layer.
+
+inputs:
+  vault-url:
+    description: Override the Vault address; empty probes. Passed to vault-address.
+    required: false
+    default: ""
+
+outputs:
+  registry:
+    description: >-
+      Where to push. Always `docker.valhalla.life` - either reached directly
+      from inside the cluster, or through the tunnel from outside. Harbor stores
+      by repository path, so the cluster pulls the same reference regardless.
+    value: ${{ steps.route.outputs.host }}
+
+runs:
+  using: composite
+  steps:
+    - uses: peavers/.github/actions/vault-address@main
+      id: vault
+      with:
+        vault-url: ${{ inputs.vault-url }}
+
+    - name: Harbor credentials from Vault
+      id: harbor
+      uses: hashicorp/vault-action@v3
+      with:
+        url: ${{ steps.vault.outputs.url }}
+        method: jwt
+        path: jwt-github
+        role: ci
+        jwtGithubAudience: https://vault.internal
+        tlsSkipVerify: ${{ steps.vault.outputs.tls-skip-verify }}
+        exportToken: false
+        secrets: |
+          kv/data/cluster/_shared/harbor username | HARBOR_USERNAME ;
+          kv/data/cluster/_shared/harbor password | HARBOR_PASSWORD
+
+    # Only needed off-cluster, but fetched unconditionally: a conditional Vault
+    # read whose output is referenced later is an empty string, not an error.
+    - name: Cloudflare Access token for the registry tunnel
+      id: cfaccess
+      uses: hashicorp/vault-action@v3
+      with:
+        url: ${{ steps.vault.outputs.url }}
+        method: jwt
+        path: jwt-github
+        role: ci
+        jwtGithubAudience: https://vault.internal
+        tlsSkipVerify: ${{ steps.vault.outputs.tls-skip-verify }}
+        exportToken: false
+        secrets: |
+          kv/data/cluster/_shared/cloudflare-ci-access client_id | CF_ACCESS_CLIENT_ID ;
+          kv/data/cluster/_shared/cloudflare-ci-access client_secret | CF_ACCESS_CLIENT_SECRET
+
+    - name: Decide the registry address
+      id: route
+      shell: bash
+      env:
+        IN_CLUSTER: ${{ steps.vault.outputs.in-cluster }}
+        CF_ID: ${{ steps.cfaccess.outputs.cf_access_client_id }}
+        CF_SECRET: ${{ steps.cfaccess.outputs.cf_access_client_secret }}
+      run: |
+        set -euo pipefail
+        if [ "$IN_CLUSTER" = true ]; then
+          echo "host=docker.valhalla.life" >> "$GITHUB_OUTPUT"
+          echo "harbor: in-cluster, pushing straight at it"
+          exit 0
+        fi
+        if [ -z "${CF_ID:-}" ] || [ -z "${CF_SECRET:-}" ]; then
+          echo "::error::no Cloudflare Access token, so there is no route to Harbor from here."
+          exit 1
+        fi
+        if ! command -v cloudflared >/dev/null 2>&1; then
+          arch="$(uname -m)"; case "$arch" in
+            x86_64) a=amd64 ;; aarch64|arm64) a=arm64 ;;
+            *) echo "::error::no cloudflared build for ${arch}"; exit 1 ;;
+          esac
+          curl -fsSL -o /tmp/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${a}"
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+        fi
+        nohup cloudflared access tcp \
+          --hostname registry-ci.valhalla.life --url 127.0.0.1:5000 \
+          --service-token-id "$CF_ID" --service-token-secret "$CF_SECRET" \
+          > /tmp/cloudflared-registry.log 2>&1 &
+        # Wait for the listener rather than sleeping a guess - a docker login
+        # against a port that is not up yet fails in a way that reads like bad
+        # credentials.
+        for i in $(seq 1 30); do
+          if curl -s -o /dev/null --max-time 2 http://127.0.0.1:5000/v2/; then break; fi
+          sleep 1
+        done
+        if ! curl -s -o /dev/null --max-time 3 http://127.0.0.1:5000/v2/; then
+          echo "::error::the registry tunnel did not come up."; cat /tmp/cloudflared-registry.log; exit 1
+        fi
+        # The tunnel is up, but a LOOPBACK ADDRESS cannot be handed to docker.
+        #
+        # Harbor's 401 carries realm="https://<the Host it was sent>/service/token" -
+        # host taken from the request, scheme fixed at https. Against
+        # 127.0.0.1:5000 that advertises https to a plaintext listener and the
+        # docker CLI dies with "server gave HTTP response to HTTPS client".
+        # Terminating TLS on a loopback port fixes the CLI and then breaks the
+        # push instead: buildkit treats 127.0.0.1 as insecure and sends plain
+        # HTTP, so it hits the TLS listener and gets "connection reset by peer".
+        # The two clients have opposite defaults for a loopback address and no
+        # single listener satisfies both.
+        #
+        # So use the real NAME, pointed at the tunnel - the off-cluster twin of
+        # the hostAliases the ARC pods already use. Both clients then speak
+        # HTTPS to a named host, and Harbor advertises a realm on that same
+        # name, which resolves back here rather than to the capped public edge.
+        command -v socat >/dev/null 2>&1 || sudo apt-get install -y -qq socat
+
+        # Self-signed, but trusted system-wide, because buildkit verifies
+        # normally for a named host - it does not get docker's loopback
+        # exemption. Go reads the system pool, so this needs no per-registry
+        # buildkitd configuration.
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+          -keyout /tmp/harbor-tunnel.key -out /tmp/harbor-tunnel.crt \
+          -subj "/CN=docker.valhalla.life" \
+          -addext "subjectAltName=DNS:docker.valhalla.life" 2>/dev/null
+        cat /tmp/harbor-tunnel.crt /tmp/harbor-tunnel.key > /tmp/harbor-tunnel.pem
+        sudo cp /tmp/harbor-tunnel.crt /usr/local/share/ca-certificates/harbor-tunnel.crt
+        sudo update-ca-certificates >/dev/null 2>&1
+
+        sudo nohup socat OPENSSL-LISTEN:443,cert=/tmp/harbor-tunnel.pem,verify=0,reuseaddr,fork \
+          TCP:127.0.0.1:5000 > /tmp/harbor-tls.log 2>&1 &
+
+        for i in $(seq 1 15); do
+          sudo ss -ltn 2>/dev/null | grep -q ':443 ' && break
+          sleep 1
+        done
+
+        # Only redirect the name AFTER cloudflared has resolved the tunnel edge
+        # over real DNS. Doing it earlier would point cloudflared at itself.
+        echo "127.0.0.1 docker.valhalla.life" | sudo tee -a /etc/hosts >/dev/null
+
+        if ! curl -s -o /dev/null --max-time 5 https://docker.valhalla.life/v2/; then
+          echo "::error::the registry tunnel came up but TLS in front of it did not."
+          cat /tmp/harbor-tls.log; exit 1
+        fi
+
+        # Deliberately the SAME value the in-cluster branch returns, so nothing
+        # downstream has to know which kind of runner it is on.
+        echo "host=docker.valhalla.life" >> "$GITHUB_OUTPUT"
+        echo "harbor: docker.valhalla.life pointed at the CI tunnel, TLS terminated locally"
+
+
+    - name: Log in to Harbor
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ steps.route.outputs.host }}
+        # vault-action names its outputs after the env var each secret maps to,
+        # LOWERCASED. Used here rather than the env context because a composite
+        # action's `with:` is evaluated before a previous step's GITHUB_ENV is
+        # visible to it, and the failure is an empty username, not an error.
+        username: ${{ steps.harbor.outputs.harbor_username }}
+        password: ${{ steps.harbor.outputs.harbor_password }}
