@@ -138,6 +138,34 @@ e.g. `peavers-code-runners`). The calling job must set
 **Vault prerequisites** (KV under `kv/data/cluster/_shared/`): `harbor`
 (`username`, `password`) and `sonarqube` (`token`, `host_url`).
 
+## Moving a repo's jobs off the cluster
+
+Every reusable workflow here except `k8s-deploy` resolves its runner as:
+
+```yaml
+runs-on: ${{ vars.RUNNER_LABEL || inputs.runner }}
+```
+
+`vars` in a reusable workflow is read from the **calling** repository, so one
+variable moves that repo's jobs with no commit anywhere:
+
+```sh
+gh variable set RUNNER_LABEL -R <owner>/<repo> -b blacksmith-4vcpu-ubuntu-2404
+gh variable delete RUNNER_LABEL -R <owner>/<repo>     # and back
+```
+
+Unset falls through to `inputs.runner`, which is today's behaviour, so this
+changes nothing until a variable is set. It is a switch rather than a commit so
+one repo can be moved, watched for a week, and reverted without a PR.
+
+**Before setting it, check the repo reaches nothing in-cluster.** Vault
+(`vault.vault.svc.cluster.local`) has no route from outside, so anything using
+`valhalla-auth`, `gh-app-token` or its own `vault-action` still has to run
+in-cluster. `k8s-deploy` is deliberately excluded - it runs `kubectl`.
+
+A caller with a mix - one job portable, one not - pins the literal in its own
+workflow for the job that must stay, rather than setting the variable.
+
 ## Conventions
 
 - One directory per composite action under `actions/<name>/action.yml`.

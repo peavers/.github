@@ -71,7 +71,13 @@ permissions:
 
 jobs:
   cdk-deploy:
-    runs-on: ${{ inputs.runner }}
+    # RUNNER_LABEL is read from the CALLING repository - GitHub resolves the vars
+    # context of a reusable workflow against the caller, not against this repo -
+    # so one variable per repo moves that repo's jobs off the cluster without a
+    # commit anywhere. Unset falls through to `runner`, which is today's
+    # behaviour. A caller with a job that must stay in-cluster pins a literal in
+    # its own workflow rather than setting the variable.
+    runs-on: ${{ vars.RUNNER_LABEL || inputs.runner }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
