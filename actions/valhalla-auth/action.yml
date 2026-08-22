@@ -65,6 +65,15 @@ inputs:
       resolving needs npm-group, and a scope pointed at the group cannot publish.
     required: false
     default: https://packages.valhalla.life/repository/npm-group/
+  secrets:
+    description: >-
+      Any other Vault secrets this job needs, in vault-action's own syntax. Here
+      so that a workflow reading something valhalla-auth knows nothing about -
+      an R2 key, a Cloudflare token - still gets the address resolution and the
+      derived TLS verification, instead of spelling the cluster URL out and
+      becoming unmovable. Values land in the environment for later steps.
+    required: false
+    default: ""
   strict:
     description: Delete the runner-mounted credentials first, proving the job does not use them.
     required: false
@@ -142,8 +151,10 @@ runs:
       shell: bash
       env:
         WANT: ${{ inputs.harbor }}${{ inputs.maven }}${{ inputs.cargo }}${{ inputs.npm }}
+        EXTRA: ${{ inputs.secrets }}
       run: |
         set -euo pipefail
+        [ -n "${EXTRA// /}" ] && exit 0
         case "$WANT" in
           *true*) ;;
           *) echo "::error::valhalla-auth was called with no credential requested. Pass at least one of harbor / maven / cargo / npm."
@@ -154,7 +165,12 @@ runs:
     # of these credentials. See the header: without this the migration cannot be
     # verified while the mounts still exist.
     - name: Drop the runner-mounted credentials
-      if: inputs.strict == 'true'
+      # Only when a credential type was actually asked for. A secrets-only call
+      # has no business deleting an ~/.npmrc some earlier step wrote.
+      if: >-
+        inputs.strict == 'true' &&
+        (inputs.harbor == 'true' || inputs.maven == 'true' ||
+         inputs.cargo == 'true' || inputs.npm == 'true')
       shell: bash
       run: |
         set -euo pipefail
@@ -372,6 +388,19 @@ runs:
           printf 'always-auth=true\n'
         } >> "$HOME/.npmrc"
         echo "wrote ~/.npmrc for ${SCOPE} -> ${REGISTRY}"
+
+    - name: Other secrets from Vault
+      if: inputs.secrets != ''
+      uses: hashicorp/vault-action@v3
+      with:
+        url: ${{ steps.vault.outputs.url }}
+        method: jwt
+        path: jwt-github
+        role: ci
+        jwtGithubAudience: https://vault.internal
+        tlsSkipVerify: ${{ steps.vault.outputs.skip }}
+        exportToken: false
+        secrets: ${{ inputs.secrets }}
 
     # Prove the credentials actually work, here, rather than three steps later
     # inside a build whose failure will be read as a build failure.
