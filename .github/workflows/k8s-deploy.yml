@@ -42,6 +42,9 @@ on:
 
 jobs:
   deploy:
+    # Deliberately NOT on RUNNER_LABEL. This runs kubectl against the cluster, so
+    # it can only work from inside it - and a deploy that cannot run because the
+    # cluster is down is not an outage, there is nothing to deploy to.
     runs-on: ${{ inputs.runner }}
     strategy:
       matrix:
