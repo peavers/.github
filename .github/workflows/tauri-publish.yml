@@ -65,9 +65,9 @@ on:
           Getting this wrong does not fail the job, which is the whole reason it
           is an input: an unclaimable label leaves the run queued at "Waiting for
           a runner to pick up this job..." until it times out hours later, having
-          published nothing and reported no error. Any pool works provided it can
-          reach Vault at vault.vault.svc.cluster.local, which every in-cluster
-          pool can and no GitHub-hosted runner can.
+          published nothing and reported no error. Any pool works now: Vault is
+          reached at vault-ci.parses.gg, which resolves from anywhere, so this is
+          no longer restricted to the in-cluster pools.
         type: string
         default: peavers-code-runners
     secrets:
@@ -101,12 +101,15 @@ jobs:
         continue-on-error: true
         uses: hashicorp/vault-action@v3
         with:
-          url: https://vault.vault.svc.cluster.local:8200
+          # The tunnel hostname rather than the cluster service, so a caller that
+          # has moved its runner still reaches Vault. Cloudflare terminates a real
+          # certificate here, which is why verification is on - the cluster
+          # service serves a private CA and needed it skipped.
+          url: https://vault-ci.parses.gg
           method: jwt
           path: jwt-github
           role: ci
           jwtGithubAudience: https://vault.internal
-          tlsSkipVerify: true
           exportToken: false
           secrets: |
             kv/data/cluster/_shared/azure-artifact-signing tenant_id | AZURE_TENANT_ID ;
@@ -119,12 +122,15 @@ jobs:
         if: inputs.updater-key-vault-path != ''
         uses: hashicorp/vault-action@v3
         with:
-          url: https://vault.vault.svc.cluster.local:8200
+          # The tunnel hostname rather than the cluster service, so a caller that
+          # has moved its runner still reaches Vault. Cloudflare terminates a real
+          # certificate here, which is why verification is on - the cluster
+          # service serves a private CA and needed it skipped.
+          url: https://vault-ci.parses.gg
           method: jwt
           path: jwt-github
           role: ci
           jwtGithubAudience: https://vault.internal
-          tlsSkipVerify: true
           exportToken: false
           secrets: |
             kv/data/${{ inputs.updater-key-vault-path }} tauri_signing_private_key | TAURI_SIGNING_PRIVATE_KEY
