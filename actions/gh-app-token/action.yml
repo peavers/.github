@@ -2,13 +2,31 @@ name: gh-app-token
 description: >-
   Mint a short-lived GitHub App installation token via Vault OIDC. Drop-in
   replacement for "push as us" PATs — no long-lived secret is stored in GitHub.
-  MUST run on the in-cluster self-hosted runners (Vault is internal-only).
+
+  Reaches Vault at its in-cluster service address by default, so by default it
+  must run on the in-cluster self-hosted runners. Override vault-url (and
+  vault-tls-skip-verify with it) to reach Vault from anywhere else.
 
 inputs:
   owner:
     description: Org/owner to scope the token to. Defaults to the calling repo's owner.
     required: false
     default: ${{ github.repository_owner }}
+  vault-url:
+    description: >-
+      Vault address. The in-cluster service by default, which resolves only from
+      inside the cluster - so this input is what pins an otherwise portable job
+      to the self-hosted runners. Same input, same default and same meaning as
+      valhalla-auth's, so both move together.
+    required: false
+    default: https://vault.vault.svc.cluster.local:8200
+  vault-tls-skip-verify:
+    description: >-
+      Vault serves a private CA in-cluster, so this is true today. It MUST become
+      false whenever vault-url points at a public hostname with a real
+      certificate - a skipped verification there is worth nothing.
+    required: false
+    default: "true"
 
 outputs:
   token:
@@ -30,12 +48,12 @@ runs:
     - name: Fetch GitHub App key from Vault (GitHub OIDC -> jwt-github/ci)
       uses: hashicorp/vault-action@v3
       with:
-        url: https://vault.vault.svc.cluster.local:8200   # in-cluster service; no ingress hop
+        url: ${{ inputs.vault-url }}
         method: jwt
         path: jwt-github
         role: ci
         jwtGithubAudience: https://vault.internal          # must match the role's bound_audiences
-        tlsSkipVerify: true                                # internal self-signed CA (pin caCertificate to tighten)
+        tlsSkipVerify: ${{ inputs.vault-tls-skip-verify }}
         exportToken: false
         secrets: |
           kv/data/cluster/_shared/ci-github-app app_id | GH_APP_ID ;
