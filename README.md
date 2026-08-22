@@ -91,7 +91,7 @@ permissions:
 steps:
   - uses: peavers/.github/actions/valhalla-auth@main
     with:
-      harbor: true         # docker login docker.valhalla.life
+      harbor: true         # docker login, wherever Harbor is reachable from
       cargo: true          # CARGO_REGISTRIES_VALHALLA_TOKEN
       maven: true          # ~/.m2/settings.xml + NEXUS_USERNAME/PASSWORD
       npm: true            # ~/.npmrc for the @parses scope
@@ -110,6 +110,17 @@ TLS verification is *derived* from which one answered - private CA in-cluster,
 publicly trusted certificate through the tunnel. That is deliberate: it removes
 the failure where somebody repoints the URL and leaves verification off against a
 public endpoint, which nothing anywhere would report.
+
+### `actions/cache-rust` — shared sccache, wherever the runner is
+
+Points `rustc` at the shared sccache in MinIO. In-cluster it uses the `MINIO_*`
+already on the runner; anywhere else it takes the credentials from Vault and
+reaches MinIO over the CI tunnel's TCP route.
+
+`required` defaults to **true**. This action used to print a line and `exit 0`
+when it could not see MinIO, so a job moved to a runner with no route stayed
+green and recompiled everything, every time — a slower build, not a failure, and
+nothing reported it. Pass `required: false` to build cold deliberately.
 
 ### `actions/compute-version` — immutable image tag
 
