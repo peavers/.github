@@ -269,8 +269,57 @@ runs:
         if ! curl -s -o /dev/null --max-time 3 http://127.0.0.1:5000/v2/; then
           echo "::error::the registry tunnel did not come up."; cat /tmp/cloudflared-registry.log; exit 1
         fi
-        echo "host=127.0.0.1:5000" >> "$GITHUB_OUTPUT"
-        echo "harbor: reachable on 127.0.0.1:5000 through the CI tunnel"
+        # The tunnel is up, but a LOOPBACK ADDRESS cannot be handed to docker.
+        #
+        # Harbor's 401 carries realm="https://<the Host it was sent>/service/token" -
+        # host taken from the request, scheme fixed at https. Against
+        # 127.0.0.1:5000 that advertises https to a plaintext listener and the
+        # docker CLI dies with "server gave HTTP response to HTTPS client".
+        # Terminating TLS on a loopback port fixes the CLI and then breaks the
+        # push instead: buildkit treats 127.0.0.1 as insecure and sends plain
+        # HTTP, so it hits the TLS listener and gets "connection reset by peer".
+        # The two clients have opposite defaults for a loopback address and no
+        # single listener satisfies both.
+        #
+        # So use the real NAME, pointed at the tunnel - the off-cluster twin of
+        # the hostAliases the ARC pods already use. Both clients then speak
+        # HTTPS to a named host, and Harbor advertises a realm on that same
+        # name, which resolves back here rather than to the capped public edge.
+        command -v socat >/dev/null 2>&1 || sudo apt-get install -y -qq socat
+
+        # Self-signed, but trusted system-wide, because buildkit verifies
+        # normally for a named host - it does not get docker's loopback
+        # exemption. Go reads the system pool, so this needs no per-registry
+        # buildkitd configuration.
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+          -keyout /tmp/harbor-tunnel.key -out /tmp/harbor-tunnel.crt \
+          -subj "/CN=docker.valhalla.life" \
+          -addext "subjectAltName=DNS:docker.valhalla.life" 2>/dev/null
+        cat /tmp/harbor-tunnel.crt /tmp/harbor-tunnel.key > /tmp/harbor-tunnel.pem
+        sudo cp /tmp/harbor-tunnel.crt /usr/local/share/ca-certificates/harbor-tunnel.crt
+        sudo update-ca-certificates >/dev/null 2>&1
+
+        sudo nohup socat OPENSSL-LISTEN:443,cert=/tmp/harbor-tunnel.pem,verify=0,reuseaddr,fork \
+          TCP:127.0.0.1:5000 > /tmp/harbor-tls.log 2>&1 &
+
+        for i in $(seq 1 15); do
+          sudo ss -ltn 2>/dev/null | grep -q ':443 ' && break
+          sleep 1
+        done
+
+        # Only redirect the name AFTER cloudflared has resolved the tunnel edge
+        # over real DNS. Doing it earlier would point cloudflared at itself.
+        echo "127.0.0.1 docker.valhalla.life" | sudo tee -a /etc/hosts >/dev/null
+
+        if ! curl -s -o /dev/null --max-time 5 https://docker.valhalla.life/v2/; then
+          echo "::error::the registry tunnel came up but TLS in front of it did not."
+          cat /tmp/harbor-tls.log; exit 1
+        fi
+
+        # Deliberately the SAME value the in-cluster branch returns, so nothing
+        # downstream has to know which kind of runner it is on.
+        echo "host=docker.valhalla.life" >> "$GITHUB_OUTPUT"
+        echo "harbor: docker.valhalla.life pointed at the CI tunnel, TLS terminated locally"
 
     - name: Log in to Harbor
       if: inputs.harbor == 'true'
