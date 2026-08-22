@@ -121,15 +121,16 @@ jobs:
         id: version
         uses: peavers/.github/actions/compute-version@main
 
-      - name: Build & push image (Jib)
-        working-directory: ${{ inputs.working-directory }}
-        run: |
       # Where this actually pushes. The caller names its image with a registry
       # host - docker.valhalla.life/peavers/x - and that host only takes a
       # >100 MB layer over the LAN. valhalla-auth reports where the registry is
       # reachable from *this* runner, so the host is replaced and the repository
       # path kept. Harbor stores by path, so the cluster pulls the same image
       # either way.
+      #
+      # Its own step, and it has to be: an output written to $GITHUB_OUTPUT is
+      # not readable from the step that wrote it, so a resolve that ends by
+      # running gradle interpolates `-Djib.to.image=` empty.
       - name: Resolve where to push
         id: target
         shell: bash
@@ -160,6 +161,12 @@ jobs:
           esac
           echo "pushing to ${REGISTRY}/${path}"
 
+      - name: Build & push image (Jib)
+        # The gradle project is not always the repository root - see the
+        # working-directory input. Without this the run is `./gradlew` from the
+        # root and every caller with a nested project fails with exit 127.
+        working-directory: ${{ inputs.working-directory }}
+        run: |
           ./gradlew jib \
             -Djib.to.image=${{ steps.target.outputs.image }} \
             -Djib.allowInsecureRegistries=${{ steps.target.outputs.insecure }} \
