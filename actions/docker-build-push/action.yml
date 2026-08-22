@@ -1,0 +1,105 @@
+name: Docker build and push
+description: >-
+  Build a Dockerfile and push it, on a builder whose disk survives between jobs.
+
+  This exists because six repos in parses-gg carried near-identical copies of
+  it, and the day the runners moved every one of them needed the same edit.
+
+inputs:
+  image:
+    description: >-
+      Image reference WITHOUT a tag, e.g. `peavers/parses-engine`. Do not put a
+      registry host here - pass `registry` instead, from harbor-login's output,
+      so the same call works on either kind of runner.
+    required: true
+  registry:
+    description: Registry host. Use harbor-login's `registry` output.
+    required: true
+  tags:
+    description: Newline- or comma-separated tags. Defaults to the commit SHA and `latest`.
+    required: false
+    default: ""
+  context:
+    description: Build context directory.
+    required: false
+    default: "."
+  dockerfile:
+    description: Dockerfile path. Defaults to <context>/Dockerfile.
+    required: false
+    default: ""
+  cache-key:
+    description: >-
+      Sticky-disk identity. Two runs sharing it are what make the Dockerfile's
+      RUN --mount=type=cache mounts persist. Defaults to the repository.
+    required: false
+    default: ""
+  secrets:
+    description: BuildKit secrets, `id=value` per line. Never build args - an arg is in the image history.
+    required: false
+    default: ""
+  push:
+    description: Push, or build only.
+    required: false
+    default: "true"
+
+outputs:
+  tags:
+    description: The full tag list that was built.
+    value: ${{ steps.plan.outputs.tags }}
+
+runs:
+  using: composite
+  steps:
+    - name: Work out the tags
+      id: plan
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        IMAGE: ${{ inputs.image }}
+        GIVEN: ${{ inputs.tags }}
+      run: |
+        set -euo pipefail
+        if [ -z "${REGISTRY}" ]; then
+          echo "::error::no registry given - pass harbor-login's registry output, not a literal."
+          exit 1
+        fi
+        case "${IMAGE}" in
+          *.*/*|*:*)
+            echo "::error::image should be a repository path like peavers/foo, with the host passed as registry."
+            exit 1 ;;
+        esac
+        if [ -n "${GIVEN}" ]; then
+          list="$(echo "${GIVEN}" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | sed "s#^#${REGISTRY}/${IMAGE}:#")"
+        else
+          list="${REGISTRY}/${IMAGE}:${GITHUB_SHA}
+        ${REGISTRY}/${IMAGE}:latest"
+        fi
+        {
+          echo "tags<<EOF"
+          echo "${list}" | sed 's/^[[:space:]]*//'
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+        echo "pushing:"; echo "${list}" | sed 's/^[[:space:]]*/  /'
+
+    # Blacksmith's buildkitd runs on the runner host over a unix socket rather
+    # than in a container created by dind, so the driver-opts: network=host the
+    # hand-rolled copies carried is not unsupported - it is unnecessary.
+    - uses: useblacksmith/setup-docker-builder@v2
+      with:
+        cache-key: ${{ inputs.cache-key != '' && inputs.cache-key || github.repository }}
+        # Fail rather than fall back to a local builder. A fallback still
+        # passes, silently uncached, which is how the sccache step this
+        # replaced went unnoticed for months.
+        nofallback: true
+
+    # No registry buildcache on purpose: the sticky disk keeps that state
+    # locally, so 314-575 MB no longer crosses the network on every build.
+    - uses: useblacksmith/build-push-action@v2
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        push: ${{ inputs.push }}
+        # No attestation manifests: a second manifest per image for no consumer.
+        provenance: false
+        tags: ${{ steps.plan.outputs.tags }}
+        secrets: ${{ inputs.secrets }}

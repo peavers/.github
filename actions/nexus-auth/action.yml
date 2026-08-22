@@ -1,0 +1,161 @@
+name: Nexus auth
+description: >-
+  Authenticate this job to the Nexus at packages.valhalla.life - Maven, cargo
+  and npm, from one Vault read, because they are all the same `runners` user.
+
+  Ask for what the job actually uses. A job that resolves dependencies and does
+  not say so works only where something else supplies the credential, which is
+  how `./gradlew build` in two release workflows depended on a Kubernetes pod
+  without anything recording it.
+
+inputs:
+  maven:
+    description: Write ~/.m2/settings.xml, mirroring everything at maven-public.
+    required: false
+    default: "false"
+  cargo:
+    description: Export CARGO_REGISTRIES_VALHALLA_TOKEN for the `valhalla` sparse registry.
+    required: false
+    default: "false"
+  npm:
+    description: Write the scope and its _auth line into ~/.npmrc.
+    required: false
+    default: "false"
+  npm-scope:
+    description: Scope to point at Nexus.
+    required: false
+    default: "@parses"
+  npm-registry:
+    description: >-
+      Registry the scope resolves from. npm-group proxies npmjs and serves the
+      private packages; npm-hosted is publish-only.
+    required: false
+    default: "https://packages.valhalla.life/repository/npm-group/"
+  vault-url:
+    description: Override the Vault address; empty probes.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: peavers/.github/actions/vault-address@main
+      id: vault
+      with:
+        vault-url: ${{ inputs.vault-url }}
+
+    - name: Check something was asked for
+      shell: bash
+      env:
+        MAVEN: ${{ inputs.maven }}
+        CARGO: ${{ inputs.cargo }}
+        NPM: ${{ inputs.npm }}
+      run: |
+        if [ "$MAVEN" != true ] && [ "$CARGO" != true ] && [ "$NPM" != true ]; then
+          echo "::error::nexus-auth was called with nothing to do - set maven, cargo or npm."
+          exit 1
+        fi
+
+    - name: Nexus credentials from Vault
+      if: inputs.maven == 'true' || inputs.cargo == 'true'
+      uses: hashicorp/vault-action@v3
+      with:
+        url: ${{ steps.vault.outputs.url }}
+        method: jwt
+        path: jwt-github
+        role: ci
+        jwtGithubAudience: https://vault.internal
+        tlsSkipVerify: ${{ steps.vault.outputs.tls-skip-verify }}
+        exportToken: false
+        secrets: |
+          kv/data/cluster/_shared/nexus-runners username | NEXUS_USERNAME ;
+          kv/data/cluster/_shared/nexus-runners password | NEXUS_PASSWORD
+
+    - name: Write ~/.m2/settings.xml
+      if: inputs.maven == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Identical to the settings.xml the runner pods mounted, and it holds no
+        # secret: the password is a ${env.NEXUS_PASSWORD} reference that Maven
+        # resolves at run time. Only the environment variable is sensitive.
+        mkdir -p "$HOME/.m2"
+        cat > "$HOME/.m2/settings.xml" <<'XML'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+          <mirrors>
+            <mirror>
+              <id>nexus-public</id>
+              <url>https://packages.valhalla.life/repository/maven-public/</url>
+              <mirrorOf>*</mirrorOf>
+            </mirror>
+          </mirrors>
+          <servers>
+            <server>
+              <id>nexus-public</id>
+              <username>${env.NEXUS_USERNAME}</username>
+              <password>${env.NEXUS_PASSWORD}</password>
+            </server>
+            <server>
+              <id>nexus-releases</id>
+              <username>${env.NEXUS_USERNAME}</username>
+              <password>${env.NEXUS_PASSWORD}</password>
+            </server>
+            <server>
+              <id>nexus-snapshots</id>
+              <username>${env.NEXUS_USERNAME}</username>
+              <password>${env.NEXUS_PASSWORD}</password>
+            </server>
+          </servers>
+        </settings>
+        XML
+        echo "wrote ~/.m2/settings.xml for user ${NEXUS_USERNAME}"
+
+    - name: Export the cargo registry token
+      if: inputs.cargo == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # cargo wants HTTP Basic. Masked before it is written so a later step
+        # dumping the environment cannot leak it.
+        TOKEN="$(printf '%s:%s' "${NEXUS_USERNAME}" "${NEXUS_PASSWORD}" | base64 -w0)"
+        echo "::add-mask::${TOKEN}"
+        echo "CARGO_REGISTRIES_VALHALLA_TOKEN=Basic ${TOKEN}" >> "$GITHUB_ENV"
+        echo "cargo registry 'valhalla' authenticated as ${NEXUS_USERNAME}"
+
+    - name: Nexus npm auth from Vault
+      if: inputs.npm == 'true'
+      uses: hashicorp/vault-action@v3
+      with:
+        url: ${{ steps.vault.outputs.url }}
+        method: jwt
+        path: jwt-github
+        role: ci
+        jwtGithubAudience: https://vault.internal
+        tlsSkipVerify: ${{ steps.vault.outputs.tls-skip-verify }}
+        exportToken: false
+        secrets: |
+          kv/data/cluster/_shared/nexus-npm auth | NEXUS_NPM_AUTH
+
+    - name: Write ~/.npmrc
+      if: inputs.npm == 'true'
+      shell: bash
+      env:
+        SCOPE: ${{ inputs.npm-scope }}
+        REGISTRY: ${{ inputs.npm-registry }}
+      run: |
+        set -euo pipefail
+        # The _auth line is keyed on the registry path, so it has to match the
+        # scope's registry exactly - a scope pointed at npm-hosted with an _auth
+        # for npm-group authenticates nothing, and npm reports it as a 401 on
+        # publish rather than as a configuration error.
+        path="${REGISTRY#https:}"
+        {
+          printf '%s:registry=%s\n' "${SCOPE}" "${REGISTRY}"
+          printf '%s:_auth=%s\n' "${path}" "${NEXUS_NPM_AUTH}"
+          printf 'always-auth=true\n'
+        } >> "$HOME/.npmrc"
+        echo "wrote ~/.npmrc for ${SCOPE} -> ${REGISTRY}"
+

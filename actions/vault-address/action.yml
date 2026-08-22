@@ -1,0 +1,61 @@
+name: Vault address
+description: >-
+  Work out where Vault is from this runner, and whether its certificate can be
+  verified. The smallest shared piece: valhalla-auth, nexus-auth, harbor-login
+  and gh-app-token all need it and all used to carry their own copy.
+
+inputs:
+  vault-url:
+    description: >-
+      Override the address. Leave empty and this probes: the in-cluster service
+      if it answers, the CI tunnel otherwise. Setting it skips the probe, which
+      is worth a second in a job that already knows.
+    required: false
+    default: ""
+
+outputs:
+  url:
+    description: The Vault address to use.
+    value: ${{ steps.resolve.outputs.url }}
+  tls-skip-verify:
+    description: >-
+      Whether to skip certificate verification. DERIVED, never passed in - the
+      private CA is only valid inside the cluster, and a hardcoded `true`
+      against a public endpoint silently downgrades the check.
+    value: ${{ steps.resolve.outputs.skip }}
+  in-cluster:
+    description: >-
+      Whether the in-cluster service answered. Not a guess about the runner -
+      it is whether the cluster service just replied.
+    value: ${{ steps.resolve.outputs.in_cluster }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the Vault address
+      id: resolve
+      shell: bash
+      env:
+        EXPLICIT: ${{ inputs.vault-url }}
+        IN_CLUSTER: https://vault.vault.svc.cluster.local:8200
+        VIA_TUNNEL: https://vault-ci.valhalla.life
+      run: |
+        set -euo pipefail
+        if [ -n "${EXPLICIT}" ]; then
+          url="${EXPLICIT}"
+          echo "vault: using the address this workflow asked for"
+        elif curl -fsk --max-time 5 "${IN_CLUSTER}/v1/sys/health?standbyok=true" >/dev/null 2>&1; then
+          url="${IN_CLUSTER}"
+          echo "vault: in-cluster service answered - using it"
+        else
+          url="${VIA_TUNNEL}"
+          echo "vault: no route to the cluster service - using the tunnel"
+        fi
+        case "$url" in
+          *.svc.cluster.local*) skip=true  ;;   # private CA, only valid inside
+          *)                    skip=false ;;   # public certificate, verify it
+        esac
+        echo "url=$url"          >> "$GITHUB_OUTPUT"
+        echo "skip=$skip"        >> "$GITHUB_OUTPUT"
+        echo "in_cluster=$skip"  >> "$GITHUB_OUTPUT"
+        echo "vault: $url (tlsSkipVerify=$skip)"
