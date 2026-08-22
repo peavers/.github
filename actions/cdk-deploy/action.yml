@@ -77,7 +77,11 @@ runs:
       if: inputs.domain != '' && inputs.cloudflare-zone != ''
       uses: hashicorp/vault-action@v3
       with:
-        url: https://vault.vault.svc.cluster.local:8200
+        # The tunnel hostname rather than the cluster service, so a caller that
+        # has moved its runner still reaches Vault. Cloudflare terminates a real
+        # certificate here, which is why verification is on - the cluster service
+        # serves a private CA and needed it skipped.
+        url: https://vault-ci.parses.gg
         method: jwt
         path: jwt-github
         role: ci
