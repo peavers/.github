@@ -135,6 +135,34 @@ runs:
         sudo cp /tmp/harbor-tunnel.crt /usr/local/share/ca-certificates/harbor-tunnel.crt
         sudo update-ca-certificates >/dev/null 2>&1
 
+        # update-ca-certificates covers the system pool, which is what Go - and
+        # therefore buildkit and the docker CLI - reads. A JVM does not read it:
+        # setup-java brings its own truststore under JAVA_HOME. jib is a JVM
+        # registry client, so without this the FIRST off-cluster jib build dies
+        # on a PKIX path error, both pulling its base image and pushing, and that
+        # error reads like Harbor being down rather than like a local certificate.
+        #
+        # Guarded on JAVA_HOME, so it is a no-op for a caller with no JDK, and
+        # non-fatal: a JVM that cannot be taught the cert is only a problem for a
+        # jib caller, which will say so loudly a step later.
+        if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/keytool" ]; then
+          ks="$JAVA_HOME/lib/security/cacerts"
+          # Unprivileged first: setup-java's JDK lives in the tool cache and is
+          # writable by the runner user. sudo is the fallback for a system JDK,
+          # and only there, because a root-owned rewrite of a user-owned keystore
+          # is a worse outcome than the import failing.
+          import_cert() {
+            "$@" -importcert -noprompt -trustcacerts \
+              -alias harbor-tunnel -file /tmp/harbor-tunnel.crt \
+              -keystore "$ks" -storepass changeit >/dev/null 2>&1
+          }
+          if import_cert "$JAVA_HOME/bin/keytool" || import_cert sudo "$JAVA_HOME/bin/keytool"; then
+            echo "harbor: tunnel certificate also trusted by the JDK at $JAVA_HOME"
+          else
+            echo "::warning::could not add the tunnel certificate to $ks - a jib push from here will fail TLS verification"
+          fi
+        fi
+
         sudo nohup socat OPENSSL-LISTEN:443,cert=/tmp/harbor-tunnel.pem,verify=0,reuseaddr,fork \
           TCP:127.0.0.1:5000 > /tmp/harbor-tls.log 2>&1 &
 
