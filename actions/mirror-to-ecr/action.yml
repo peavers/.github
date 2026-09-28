@@ -1,0 +1,85 @@
+name: Mirror to ECR
+description: >-
+  Copy an image that has just been pushed to Harbor into ECR, registry to
+  registry, preserving the digest.
+
+  For builders that can only push to one place. Buildx can be handed two sets of
+  tags and push once (see docker-build-push's `ecr` input), and where that is
+  possible it is better — the two registries then hold the same digest because
+  one push put it there. Jib cannot: `jib.to.image` is singular. So this copies
+  afterwards, and `crane copy` moves the manifest and blobs unaltered rather
+  than re-pushing a rebuilt image, which is what keeps the digests equal.
+
+inputs:
+  image:
+    description: >-
+      The image reference that was just pushed, without a tag — exactly what the
+      caller handed its builder. The host is stripped and the repository path
+      reused under ECR, so `<anything>/peavers/foo` becomes
+      `<account>.dkr.ecr.<region>.amazonaws.com/peavers/foo`. That matters
+      because off-cluster the host is a loopback address fronting the tunnel,
+      not a name ECR would recognise.
+    required: true
+  tags:
+    description: Comma-separated tags to copy, as handed to the builder.
+    required: true
+  aws-region:
+    required: false
+    default: us-east-1
+  aws-role:
+    required: false
+    default: arn:aws:iam::665316247771:role/github-actions-ci
+
+runs:
+  using: composite
+  steps:
+    - uses: aws-actions/configure-aws-credentials@v5
+      with:
+        role-to-assume: ${{ inputs.aws-role }}
+        aws-region: ${{ inputs.aws-region }}
+    - uses: aws-actions/amazon-ecr-login@v2
+      id: ecr
+
+    - name: Copy each tag into ECR
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        TAGS: ${{ inputs.tags }}
+        ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+      run: |
+        set -euo pipefail
+
+        # crane reads ~/.docker/config.json, which valhalla-auth and the ECR
+        # login above have both already written to — so no credential is handled
+        # here, and none is passed on a command line where it would be logged.
+        curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz" \
+          | tar -xz -C /usr/local/bin crane
+        crane version
+
+        # Everything after the host. A registry host is the first path segment
+        # and always contains a dot or a colon; jib and buildx are both handed a
+        # fully-qualified reference, so there is always one to strip.
+        case "${IMAGE}" in
+          */*) path="${IMAGE#*/}" ;;
+          *)   echo "::error::image '${IMAGE}' has no registry host to strip"; exit 1 ;;
+        esac
+
+        echo "mirroring ${IMAGE} -> ${ECR_REGISTRY}/${path}"
+        IFS=',' read -ra list <<< "${TAGS}"
+        for tag in "${list[@]}"; do
+          tag="$(echo "${tag}" | tr -d '[:space:]')"
+          [ -n "${tag}" ] || continue
+          crane copy "${IMAGE}:${tag}" "${ECR_REGISTRY}/${path}:${tag}"
+        done
+
+        # Prove it rather than trust it. A copy that silently produced a
+        # different manifest would mean the cluster runs something other than
+        # what was released, and nothing downstream would notice.
+        first="$(echo "${list[0]}" | tr -d '[:space:]')"
+        src="$(crane digest "${IMAGE}:${first}")"
+        dst="$(crane digest "${ECR_REGISTRY}/${path}:${first}")"
+        if [ "${src}" != "${dst}" ]; then
+          echo "::error::digest mismatch after copy: ${src} != ${dst}"
+          exit 1
+        fi
+        echo "digests match: ${src}"
