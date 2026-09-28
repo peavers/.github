@@ -45,14 +45,22 @@ on:
         default: ubuntu-latest
       ecr:
         description: >-
-          Also publish to ECR, which is where the cluster is moving
-          (peavers-code/ecr). Copied after the push rather than pushed twice,
-          because these builders take a single destination; crane moves the
-          manifest unaltered, so the digests match and the step fails if they
-          do not. Needs id-token: write, which the Vault exchange already has.
+          Publish to ECR (peavers-code/ecr) rather than Harbor. These builders
+          take a single destination, so this redirects it rather than adding
+          one - `harbor: true` alongside keeps Harbor as well, by copying
+          afterwards with crane, which is what the migration used.
+          Needs id-token: write, which the Vault exchange already has.
         required: false
         type: boolean
         default: false
+      harbor:
+        description: >-
+          Keep publishing to Harbor. True by default so nothing changed for a
+          caller that has not opted into ECR; set it false together with
+          `ecr: true` for ECR alone, which is the end state.
+        required: false
+        type: boolean
+        default: true
       registry:
         description: Container registry host (for docker login).
         required: false
@@ -88,8 +96,15 @@ jobs:
 
       # Harbor credentials and the route to Harbor. In-cluster that is the
       # registry directly; anywhere else this opens the CI tunnel.
+      # Skipped entirely when Harbor is not a destination. It is called here for
+      # the Harbor credential and nothing else - `registry` is its only consumed
+      # output, and Nexus comes from its own step below - and valhalla-auth
+      # fails by design when asked for no credential at all. Leaving it to run
+      # would fail the build over a registry it never touches, which is exactly
+      # what scaling Harbor to zero has to not do.
       - uses: peavers/.github/actions/valhalla-auth@main
         id: auth
+        if: inputs.harbor
         with:
           harbor: true
 
@@ -106,6 +121,18 @@ jobs:
       # reachable from *this* runner, so the host is replaced and the repository
       # path kept. Harbor stores by path, so the cluster pulls the same image
       # either way.
+      # Before the target is resolved, because that step needs this host, and
+      # before the build, because jib pulls its base image from here too once
+      # spring-base lives in ECR.
+      - uses: aws-actions/configure-aws-credentials@v5
+        if: inputs.ecr
+        with:
+          role-to-assume: arn:aws:iam::665316247771:role/github-actions-ci
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+        if: inputs.ecr
+
       - name: Resolve where to push
         id: target
         shell: bash
@@ -113,8 +140,16 @@ jobs:
           IMAGE: ${{ inputs.image }}
           REGISTRY: ${{ steps.auth.outputs.registry }}
           DECLARED: ${{ inputs.registry }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          KEEP_HARBOR: ${{ inputs.harbor }}
         run: |
           set -euo pipefail
+          # ECR instead of Harbor, not as well as: these builders take one
+          # destination. With harbor still true the push goes to Harbor and a
+          # crane copy follows, which is how the migration ran.
+          if [ -n "${ECR_REGISTRY:-}" ] && [ "${KEEP_HARBOR}" != "true" ]; then
+            REGISTRY="${ECR_REGISTRY}"
+          fi
           first="${IMAGE%%/*}"
           # Only re-host an image that names THIS workflow's registry. A caller
           # pushing somewhere else entirely - ghcr.io, a public registry - must
@@ -152,7 +187,7 @@ jobs:
       # this workflow and the jib one behave identically for a caller — same
       # input, same guarantee, one place to change when Harbor goes.
       - name: Mirror to ECR
-        if: inputs.ecr
+        if: inputs.ecr && inputs.harbor
         uses: peavers/.github/actions/mirror-to-ecr@main
         with:
           image: ${{ steps.target.outputs.image }}
