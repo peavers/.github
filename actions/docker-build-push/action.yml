@@ -41,6 +41,27 @@ inputs:
     description: Push, or build only.
     required: false
     default: "true"
+  ecr:
+    description: >-
+      Also push to ECR, which is where the cluster is moving
+      (peavers-code/ecr). The same build is tagged for both registries and
+      pushed once, so the two hold the same bytes by construction rather than
+      by a later copy. Needs `id-token: write`, which callers already have for
+      the Vault exchange.
+
+      While this is true for a repo mid-migration, Harbor stays the registry its
+      manifests name. ECR becomes the only push target once every namespace has
+      moved, and then this input goes away.
+    required: false
+    default: "false"
+  aws-region:
+    description: Region for the ECR login.
+    required: false
+    default: us-east-1
+  aws-role:
+    description: Role to assume for the ECR push.
+    required: false
+    default: arn:aws:iam::665316247771:role/github-actions-ci
 
 outputs:
   tags:
@@ -50,6 +71,16 @@ outputs:
 runs:
   using: composite
   steps:
+    # Before the tag plan, because the plan needs the registry host this prints.
+    - uses: aws-actions/configure-aws-credentials@v5
+      if: inputs.ecr == 'true'
+      with:
+        role-to-assume: ${{ inputs.aws-role }}
+        aws-region: ${{ inputs.aws-region }}
+    - uses: aws-actions/amazon-ecr-login@v2
+      id: ecr
+      if: inputs.ecr == 'true'
+
     - name: Work out the tags
       id: plan
       shell: bash
@@ -57,6 +88,7 @@ runs:
         REGISTRY: ${{ inputs.registry }}
         IMAGE: ${{ inputs.image }}
         GIVEN: ${{ inputs.tags }}
+        ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
       run: |
         set -euo pipefail
         if [ -z "${REGISTRY}" ]; then
@@ -74,12 +106,20 @@ runs:
           list="${REGISTRY}/${IMAGE}:${GITHUB_SHA}
         ${REGISTRY}/${IMAGE}:latest"
         fi
+        list="$(echo "${list}" | sed 's/^[[:space:]]*//')"
+        # The same tags again under the ECR host. One build, two destinations:
+        # Harbor and ECR end up holding the same digest because buildx pushed it
+        # to both, not because something copied it afterwards and might not have.
+        if [ -n "${ECR_REGISTRY:-}" ]; then
+          mirrored="$(echo "${list}" | sed "s#^${REGISTRY}/#${ECR_REGISTRY}/#")"
+          list="$(printf '%s\n%s' "${list}" "${mirrored}")"
+        fi
         {
           echo "tags<<EOF"
-          echo "${list}" | sed 's/^[[:space:]]*//'
+          echo "${list}"
           echo "EOF"
         } >> "$GITHUB_OUTPUT"
-        echo "pushing:"; echo "${list}" | sed 's/^[[:space:]]*/  /'
+        echo "pushing:"; echo "${list}" | sed 's/^/  /'
 
     # Blacksmith's buildkitd runs on the runner host over a unix socket rather
     # than in a container created by dind, so the driver-opts: network=host the
