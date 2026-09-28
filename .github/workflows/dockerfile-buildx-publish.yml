@@ -43,6 +43,16 @@ on:
         required: false
         type: string
         default: ubuntu-latest
+      ecr:
+        description: >-
+          Also publish to ECR, which is where the cluster is moving
+          (peavers-code/ecr). Copied after the push rather than pushed twice,
+          because these builders take a single destination; crane moves the
+          manifest unaltered, so the digests match and the step fails if they
+          do not. Needs id-token: write, which the Vault exchange already has.
+        required: false
+        type: boolean
+        default: false
       registry:
         description: Container registry host (for docker login).
         required: false
@@ -136,3 +146,14 @@ jobs:
           tags: |
             ${{ steps.target.outputs.image }}:latest
             ${{ steps.target.outputs.image }}:${{ steps.version.outputs.version }}
+
+      # Buildx could have been handed both registries' tags and pushed once,
+      # which is what docker-build-push does. It is a copy here only so that
+      # this workflow and the jib one behave identically for a caller — same
+      # input, same guarantee, one place to change when Harbor goes.
+      - name: Mirror to ECR
+        if: inputs.ecr
+        uses: peavers/.github/actions/mirror-to-ecr@main
+        with:
+          image: ${{ steps.target.outputs.image }}
+          tags: latest,${{ steps.version.outputs.version }}
