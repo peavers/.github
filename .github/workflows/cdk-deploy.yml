@@ -26,9 +26,14 @@ on:
         required: true
         type: string
       runner:
+        description: >-
+          Runner label. Defaults to ubuntu-latest, which any org can claim; set
+          RUNNER_LABEL on the calling repo to move it to Blacksmith. Naming a
+          pool that does not exist does not fail - it leaves the run queued at
+          "Waiting for a runner" until it times out hours later.
         required: false
         type: string
-        default: warcraft-runners
+        default: ubuntu-latest
       node-version:
         required: false
         type: string
