@@ -13,8 +13,13 @@ inputs:
       so the same call works on either kind of runner.
     required: true
   registry:
-    description: Registry host. Use harbor-login's `registry` output.
-    required: true
+    description: >-
+      Harbor host, from harbor-login's `registry` output. Optional now that ECR
+      exists: leave it unset and `ecr: true` and the build goes to ECR alone,
+      which is the end state. Set both only while a repo is mid-migration and
+      wants the two registries kept in step.
+    required: false
+    default: ""
   tags:
     description: Newline- or comma-separated tags. Defaults to the commit SHA and `latest`.
     required: false
@@ -43,15 +48,11 @@ inputs:
     default: "true"
   ecr:
     description: >-
-      Also push to ECR, which is where the cluster is moving
-      (peavers-code/ecr). The same build is tagged for both registries and
-      pushed once, so the two hold the same bytes by construction rather than
-      by a later copy. Needs `id-token: write`, which callers already have for
-      the Vault exchange.
-
-      While this is true for a repo mid-migration, Harbor stays the registry its
-      manifests name. ECR becomes the only push target once every namespace has
-      moved, and then this input goes away.
+      Push to ECR (peavers-code/ecr). With `registry` unset this is the only
+      destination; with both, the same build is tagged for each and pushed once,
+      so they hold the same bytes by construction rather than by a later copy.
+      Needs `id-token: write`, which callers already have for the Vault
+      exchange.
     required: false
     default: "false"
   aws-region:
@@ -91,9 +92,16 @@ runs:
         ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
       run: |
         set -euo pipefail
-        if [ -z "${REGISTRY}" ]; then
-          echo "::error::no registry given - pass harbor-login's registry output, not a literal."
+        if [ -z "${REGISTRY}" ] && [ -z "${ECR_REGISTRY:-}" ]; then
+          echo "::error::nowhere to push. Set ecr: true, or pass harbor-login's registry output."
           exit 1
+        fi
+        # ECR alone is the normal case now. Everything below builds the Harbor
+        # list first and mirrors it, so with no Harbor host the base list is
+        # built against ECR instead and the mirror step has nothing to add.
+        if [ -z "${REGISTRY}" ]; then
+          REGISTRY="${ECR_REGISTRY}"
+          ECR_REGISTRY=""
         fi
         case "${IMAGE}" in
           *.*/*|*:*)
