@@ -36,9 +36,15 @@ on:
         required: true
         type: string
       runner:
-        required: false
+        description: >-
+          The in-cluster pool to run kubectl from. Required, and deliberately
+          without a default: self-hosted runners are org-scoped, so only the
+          caller knows which pool it can actually claim, and an unclaimable
+          label does not fail - it leaves the run queued until it times out,
+          having deployed nothing and reported no error. A missing required
+          input is rejected when the run starts, which is the failure you want.
+        required: true
         type: string
-        default: warcraft-runners
 
 jobs:
   deploy:

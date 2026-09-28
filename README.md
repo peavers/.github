@@ -130,11 +130,20 @@ build workflows below so every push gets a unique, reproducible tag.
 
 ## Reusable workflows — JVM services (Harbor + K8s)
 
-The Gradle/Spring Boot service pipeline. All build/deploy jobs pull Harbor and
-SonarQube creds from in-cluster Vault, so they **MUST run on the self-hosted
-in-cluster runners** (`warcraft-runners` by default; pass `runner:` to override,
-e.g. `peavers-code-runners`). The calling job must set
-`permissions: { id-token: write, contents: read }` for the Vault OIDC exchange.
+The Gradle/Spring Boot service pipeline. The **build** jobs reach Harbor, Nexus
+and SonarQube through `valhalla-auth`, which resolves Vault at run time and opens
+the CI tunnel when it is not in the cluster — so they run anywhere and default to
+`ubuntu-latest`. Set `RUNNER_LABEL` on the calling repo to move them to
+Blacksmith without a commit, or pass `runner:` to name a pool.
+
+**`k8s-deploy.yml` is the exception**: it runs `kubectl` against the cluster, so
+it needs an in-cluster pool and its `runner` input is required. Self-hosted
+runners are org-scoped, so pass your own org's (`peavers-code-runners`,
+`parses-gg-runners`). It deliberately ignores `RUNNER_LABEL`, so the variable
+that moves a repo's builds off the cluster leaves its deploy behind.
+
+The calling job must set `permissions: { id-token: write, contents: read }` for
+the Vault OIDC exchange.
 
 - `gradle-jib-publish.yml` — `./gradlew jib` -> Harbor. Inputs: `working-directory`,
   `image`, `java-version` (25), `runner`, `registry`. Outputs `version`/`tags`.
