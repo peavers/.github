@@ -11,6 +11,7 @@ actions/                 composite actions  ->  uses: peavers/.github/actions/<n
   gh-app-token/          mint a GitHub App token via Vault OIDC (PAT replacement)
   valhalla-auth/         fetch Harbor / Nexus credentials from Vault at run time
   compute-version/       derive an immutable image tag (semver / 7-char SHA)
+  merge-when-green/      wait for a bot PR's checks to pass, then merge it
 .github/
   workflows/             reusable workflows ->  uses: peavers/.github/.github/workflows/<file>@main
     gradle-jib-publish        build a Spring Boot service with Jib -> Harbor
