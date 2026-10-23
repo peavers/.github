@@ -1,0 +1,66 @@
+name: merge-when-green
+description: >-
+  Wait for a pull request's checks to pass, then merge it. For pull requests a
+  workflow opens itself, in repositories where no status check can be required.
+
+  GitHub's own auto-merge waits only for *required* checks. On a private
+  repository on the free plan none can be set, so a PR is mergeable the moment
+  it opens and `gh pr merge --auto` merges it on the spot, before CI has run.
+  This waits for the checks that actually run on the PR instead.
+
+  Fails the step, and leaves the PR open, when any check fails or when no check
+  has appeared within `appear-timeout` seconds - a PR nothing has looked at is
+  not one to merge.
+
+inputs:
+  pr:
+    description: The pull request - number, URL or head branch.
+    required: true
+  token:
+    description: >-
+      A token that can read checks and merge, and whose pushes trigger CI (an App
+      token, not GITHUB_TOKEN - a PR opened with GITHUB_TOKEN runs no workflows,
+      so this would wait for checks that never come).
+    required: true
+  repo:
+    description: owner/name. Defaults to the calling repository.
+    required: false
+    default: ${{ github.repository }}
+  appear-timeout:
+    description: Seconds to wait for the first check to register.
+    required: false
+    default: "300"
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR: ${{ inputs.pr }}
+        REPO: ${{ inputs.repo }}
+        APPEAR: ${{ inputs.appear-timeout }}
+      run: |
+        set -euo pipefail
+        # Checks register a few seconds after the push that opened the PR.
+        # Watching before any exist reports "no checks" and would read as green.
+        waited=0
+        until [ "$(gh pr checks "$PR" -R "$REPO" --json name --jq 'length' 2>/dev/null || echo 0)" -gt 0 ]; do
+          if [ "$waited" -ge "$APPEAR" ]; then
+            echo "::error::no check appeared on $PR within ${APPEAR}s; leaving it open"
+            exit 1
+          fi
+          sleep 10
+          waited=$((waited + 10))
+        done
+        if ! gh pr checks "$PR" -R "$REPO" --watch --fail-fast --interval 15; then
+          echo "::error::a check failed on $PR; leaving it open"
+          exit 1
+        fi
+        for method in --squash --merge --rebase; do
+          if gh pr merge "$PR" -R "$REPO" "$method" --delete-branch; then
+            exit 0
+          fi
+        done
+        echo "::error::$PR passed its checks but no merge method was accepted"
+        exit 1
