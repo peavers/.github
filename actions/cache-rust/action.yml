@@ -1,188 +1,80 @@
 name: cache-rust
 description: >-
-  Point the Rust compiler at a shared sccache backed by the in-cluster MinIO
-  bucket (actions-cache), using the MINIO_* credentials the runners already
-  carry.
+  Point the Rust compiler at sccache backed by the GitHub Actions cache.
 
-  sccache caches individual compilation units in object storage, so a warm build
-  fetches only the objects it needs instead of moving a multi-gigabyte target
-  directory. That matters here because the runners are ephemeral (nothing
-  persists on disk) and GitHub's own cache evicts a Rust target dir under its
-  10 GB per-repo limit — leaving cold eight-minute clippy builds at random. MinIO
-  has no such ceiling and sits inside the cluster, so hits are local.
+  sccache caches individual compilation units, so a warm build only recompiles
+  what changed, across branches and runs. The storage is the Actions cache
+  service (accelerated by Blacksmith on Blacksmith runners): per repository,
+  nothing to host, no credentials, no tunnel.
 
-  Call once before the build. It installs sccache if absent, points it at MinIO,
-  and exports RUSTC_WRAPPER for the cargo steps that follow. There is nothing to
-  save afterwards — sccache writes through as the compiler runs.
+  Until 2026-11-21 this pointed at a shared bucket in the cluster's MinIO,
+  reached from outside through the cache-ci tunnel. MinIO was retired when its
+  images stopped being published; the inputs are unchanged so no caller has to
+  change.
+
+  Call once before the build. sccache writes through as the compiler runs, so
+  there is no separate save step.
 
 inputs:
   version:
     description: sccache release to install when the runner does not already have it.
     required: false
-    default: "0.8.2"
+    default: "0.19.0"
   required:
     description: >-
-      Fail when the shared cache cannot be reached, instead of compiling cold.
-      Default true, and deliberately: this action used to print a line and exit 0,
-      so a job moved to a runner with no route to MinIO stayed green and rebuilt
-      everything from scratch every time. That is a slower build, not a failure,
-      and nothing anywhere reported it.
+      Fail when sccache cannot start, instead of compiling cold. A cold build is
+      slower, not broken, and nothing reports it, which is why this is on by
+      default.
     required: false
     default: "true"
   key-prefix:
     description: >-
-      Namespaces this repo's objects within the bucket. Defaults to the repo, so
-      unrelated projects never collide or evict each other.
+      Namespaces this job's entries within the repository's cache. The Actions
+      cache is already per repository, so this only matters to separate jobs
+      whose builds should not share objects.
     required: false
     default: ""
 
 runs:
   using: composite
   steps:
-    # MinIO is in the cluster, so a runner outside it has no route unless one is
-    # opened. When MINIO_* is already in the environment we are on an in-cluster
-    # runner and use it directly; otherwise the credentials come from Vault and
-    # the endpoint comes up over the CI tunnel's TCP route.
-    - name: Reach the shared cache
-      id: cache
-      shell: bash
-      run: |
-        set -euo pipefail
-        if [[ -n "${MINIO_ENDPOINT:-}" && -n "${MINIO_ACCESS_KEY:-}" ]]; then
-          echo "in_cluster=true" >> "$GITHUB_OUTPUT"
-          echo "cache-rust: MinIO is on this runner already"
-        else
-          echo "in_cluster=false" >> "$GITHUB_OUTPUT"
-          echo "cache-rust: no MinIO on this runner - will go through the CI tunnel"
-        fi
-
-    - name: Cache credentials from Vault
-      if: steps.cache.outputs.in_cluster != 'true'
-      uses: hashicorp/vault-action@v3
+    # Installs sccache and exports ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN,
+    # which sccache's GHA backend needs and which a composite step cannot read
+    # on its own.
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@v0.0.11
       with:
-        url: https://vault-ci.valhalla.life
-        method: jwt
-        path: jwt-github
-        role: ci
-        jwtGithubAudience: https://vault.internal
-        exportToken: false
-        secrets: |
-          kv/data/cluster/arc-runners/minio-cache-credentials MINIO_ACCESS_KEY | MINIO_ACCESS_KEY ;
-          kv/data/cluster/arc-runners/minio-cache-credentials MINIO_SECRET_KEY | MINIO_SECRET_KEY ;
-          kv/data/cluster/_shared/cloudflare-ci-access client_id | CF_ACCESS_CLIENT_ID ;
-          kv/data/cluster/_shared/cloudflare-ci-access client_secret | CF_ACCESS_CLIENT_SECRET
+        version: v${{ inputs.version }}
 
-    - name: Open the cache tunnel
-      if: steps.cache.outputs.in_cluster != 'true'
+    - name: Point rustc at sccache
       shell: bash
-      run: |
-        set -euo pipefail
-        if ! command -v cloudflared >/dev/null 2>&1; then
-          arch="$(uname -m)"; case "$arch" in
-            x86_64) a=amd64 ;; aarch64|arm64) a=arm64 ;;
-            *) echo "::error::no cloudflared build for ${arch}"; exit 1 ;;
-          esac
-          curl -fsSL -o /tmp/cloudflared \
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${a}"
-          chmod +x /tmp/cloudflared && sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
-        fi
-        nohup cloudflared access tcp \
-          --hostname cache-ci.valhalla.life --url 127.0.0.1:9000 \
-          --service-token-id "$CF_ACCESS_CLIENT_ID" \
-          --service-token-secret "$CF_ACCESS_CLIENT_SECRET" \
-          > /tmp/cloudflared-cache.log 2>&1 &
-        for i in $(seq 1 30); do
-          curl -sf --max-time 2 http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 && break
-          sleep 1
-        done
-        curl -sf --max-time 3 http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 \
-          || { echo "::error::the cache tunnel did not come up."; cat /tmp/cloudflared-cache.log; exit 1; }
-        {
-          echo "MINIO_ENDPOINT=127.0.0.1"
-          echo "MINIO_PORT=9000"
-        } >> "$GITHUB_ENV"
-        echo "cache-rust: MinIO reachable on 127.0.0.1:9000 through the CI tunnel"
-
-    - shell: bash
       env:
-        SCCACHE_VERSION: ${{ inputs.version }}
-        SCCACHE_KEY_PREFIX_INPUT: ${{ inputs.key-prefix }}
         REQUIRED: ${{ inputs.required }}
+        KEY_PREFIX: ${{ inputs.key-prefix }}
       run: |
         set -euo pipefail
-
-        if [[ -z "${MINIO_ACCESS_KEY:-}" || -z "${MINIO_ENDPOINT:-}" ]]; then
-          if [[ "${REQUIRED}" == "true" ]]; then
-            echo "::error::cache-rust: no route to the shared cache. Every crate would \
-        recompile from scratch and the build would still pass, so this fails instead. \
-        Pass required: false to build cold on purpose."
-            exit 1
-          fi
-          echo "cache-rust: MINIO_* not present and required: false — building without sccache."
-          exit 0
-        fi
-
-        # Install sccache if the image does not already ship it. The static musl
-        # build has no runtime deps and is ~10 MB; fetching it costs a second or
-        # two against the minutes it saves.
-        if ! command -v sccache >/dev/null 2>&1; then
-          echo "cache-rust: installing sccache ${SCCACHE_VERSION}"
-          arch="$(uname -m)"; case "$arch" in
-            x86_64) triple="x86_64-unknown-linux-musl" ;;
-            aarch64|arm64) triple="aarch64-unknown-linux-musl" ;;
-            *) echo "cache-rust: no sccache build for ${arch} — building without it."; exit 0 ;;
-          esac
-          tarball="sccache-v${SCCACHE_VERSION}-${triple}"
-          url="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/${tarball}.tar.gz"
-          if ! curl -fsSL "$url" -o /tmp/sccache.tgz; then
-            echo "cache-rust: could not download sccache — building without it."
-            exit 0
-          fi
-          tar -xzf /tmp/sccache.tgz -C /tmp
-          # Prefer a PATH dir the runner owns; fall back to ~/.local/bin.
-          dest="$HOME/.local/bin"; mkdir -p "$dest"
-          install -m 0755 "/tmp/${tarball}/sccache" "$dest/sccache"
-          echo "$dest" >> "$GITHUB_PATH"
-          export PATH="$dest:$PATH"
-        fi
-
-        PREFIX="${SCCACHE_KEY_PREFIX_INPUT:-sccache/${GITHUB_REPOSITORY}}"
-
-        # Persist the configuration for every step that follows in the job. sccache
-        # reads these; RUSTC_WRAPPER is what makes cargo route rustc through it.
         {
           echo "RUSTC_WRAPPER=sccache"
-          echo "SCCACHE_BUCKET=${MINIO_BUCKET:-actions-cache}"
-          echo "SCCACHE_ENDPOINT=${MINIO_ENDPOINT}:${MINIO_PORT:-9000}"
-          echo "SCCACHE_S3_USE_SSL=false"
-          echo "SCCACHE_S3_KEY_PREFIX=${PREFIX}"
-          echo "SCCACHE_REGION=us-east-1"
-          echo "AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}"
-          echo "AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}"
-          # No EC2 metadata endpoint in the cluster; stop the S3 client stalling
-          # on a probe for one.
-          echo "AWS_EC2_METADATA_DISABLED=true"
-          # sccache and cargo incremental fight — incremental keeps per-crate
-          # state that defeats a shared object cache. The runners already set
-          # this; assert it so a caller who did not still gets cache hits.
+          echo "SCCACHE_GHA_ENABLED=true"
+          # sccache and cargo incremental fight: incremental keeps per-crate
+          # state that defeats an object cache.
           echo "CARGO_INCREMENTAL=0"
+          if [[ -n "$KEY_PREFIX" ]]; then
+            echo "SCCACHE_GHA_VERSION=${KEY_PREFIX}"
+          fi
         } >> "$GITHUB_ENV"
 
-        # Start the server now with the config exported above, and prove it can
-        # reach MinIO. A failure here is not fatal — the wrapper still compiles,
-        # just without hits — but it should be visible, not silent.
-        export RUSTC_WRAPPER=sccache \
-          SCCACHE_BUCKET="${MINIO_BUCKET:-actions-cache}" \
-          SCCACHE_ENDPOINT="${MINIO_ENDPOINT}:${MINIO_PORT:-9000}" \
-          SCCACHE_S3_USE_SSL=false SCCACHE_S3_KEY_PREFIX="${PREFIX}" \
-          SCCACHE_REGION=us-east-1 \
-          AWS_ACCESS_KEY_ID="${MINIO_ACCESS_KEY}" \
-          AWS_SECRET_ACCESS_KEY="${MINIO_SECRET_KEY}" \
-          AWS_EC2_METADATA_DISABLED=true
+        export SCCACHE_GHA_ENABLED=true
+        [[ -n "$KEY_PREFIX" ]] && export SCCACHE_GHA_VERSION="$KEY_PREFIX"
         if sccache --start-server 2>/tmp/sccache-start.log; then
-          echo "cache-rust: sccache serving from s3://${MINIO_BUCKET:-actions-cache}/${PREFIX}"
-          sccache --show-stats 2>/dev/null | grep -iE "cache location|storage" || true
+          echo "cache-rust: sccache serving from the GitHub Actions cache"
+          sccache --show-stats 2>/dev/null | grep -iE "cache location" || true
         else
-          echo "cache-rust: sccache would not start — compiling without a cache."
           cat /tmp/sccache-start.log || true
+          if [[ "$REQUIRED" == "true" ]]; then
+            echo "::error::cache-rust: sccache would not start. Set required: false to compile without it."
+            exit 1
+          fi
+          echo "::warning::cache-rust: sccache would not start, compiling without a cache."
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
         fi

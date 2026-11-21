@@ -112,16 +112,14 @@ publicly trusted certificate through the tunnel. That is deliberate: it removes
 the failure where somebody repoints the URL and leaves verification off against a
 public endpoint, which nothing anywhere would report.
 
-### `actions/cache-rust` — shared sccache, wherever the runner is
+### `actions/cache-rust` — sccache on the GitHub Actions cache
 
-Points `rustc` at the shared sccache in MinIO. In-cluster it uses the `MINIO_*`
-already on the runner; anywhere else it takes the credentials from Vault and
-reaches MinIO over the CI tunnel's TCP route.
+Points `rustc` at sccache backed by the GitHub Actions cache (Blacksmith
+accelerates it on Blacksmith runners): per repository, no credentials, no
+tunnel. It used the cluster's MinIO until 2026-11-21, when MinIO was retired.
 
-`required` defaults to **true**. This action used to print a line and `exit 0`
-when it could not see MinIO, so a job moved to a runner with no route stayed
-green and recompiled everything, every time — a slower build, not a failure, and
-nothing reported it. Pass `required: false` to build cold deliberately.
+`required` defaults to **true**: if sccache cannot start the job fails rather
+than silently compiling cold. Pass `required: false` to build cold deliberately.
 
 ### `actions/compute-version` — immutable image tag
 
