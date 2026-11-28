@@ -1,0 +1,126 @@
+# Deploy by recording the new image in git. This workflow touches no cluster:
+# it rewrites the image tag in the app's manifests in the deploy repo
+# (peavers-code/kubernetes-cluster by default) and commits, and Argo CD, which
+# keeps that repo applied, rolls the app and posts argocd/<app> on the commit.
+# A revert of the commit is a rollback.
+#
+#   jobs:
+#     image:
+#       uses: peavers/.github/.github/workflows/image.yml@v1
+#       with: { image: peavers/addonsentry-admin }
+#     deploy:
+#       needs: image
+#       uses: peavers/.github/.github/workflows/deploy.yml@v1
+#       with:
+#         path: kubernetes/addonsentry-admin
+#         images: peavers/addonsentry-admin=${{ needs.image.outputs.version }}
+#
+# Every <registry>/<repository>:<tag> (or @sha256 digest) under `path` is
+# rewritten to the new tag; a repository found nowhere fails the run, since a
+# deploy that changes nothing should not look like a success. Needs
+# `id-token: write`: the commit is made with the valhalla-ci App token from
+# Vault.
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: Newline- or space-separated repository=tag pairs, e.g. peavers/fleetkeeper=abc1234.
+        type: string
+        required: true
+      path:
+        description: Directory or file in the deploy repo whose YAML holds the images.
+        type: string
+        required: true
+      repository:
+        description: The deploy repo.
+        type: string
+        default: peavers-code/kubernetes-cluster
+      branch:
+        type: string
+        default: master
+      registry:
+        type: string
+        default: 665316247771.dkr.ecr.us-east-1.amazonaws.com
+      runner:
+        description: Runner label. Default is the repo's RUNNER_LABEL, else Blacksmith.
+        type: string
+        default: ""
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ${{ inputs.runner || vars.RUNNER_LABEL || 'blacksmith-4vcpu-ubuntu-2404' }}
+    # One deploy commit per app at a time; a newer one queues behind it.
+    concurrency:
+      group: deploy-${{ inputs.repository }}-${{ inputs.path }}
+      cancel-in-progress: false
+    steps:
+      - id: owner
+        env:
+          REPOSITORY: ${{ inputs.repository }}
+        run: echo "owner=${REPOSITORY%%/*}" >> "$GITHUB_OUTPUT"
+
+      - id: token
+        uses: peavers/.github/actions/gh-app-token@v1
+        with:
+          owner: ${{ steps.owner.outputs.owner }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.branch }}
+          token: ${{ steps.token.outputs.token }}
+          path: deploy-repo
+
+      - name: Record and commit
+        working-directory: deploy-repo
+        env:
+          IMAGES: ${{ inputs.images }}
+          TARGET: ${{ inputs.path }}
+          REGISTRY: ${{ inputs.registry }}
+          BRANCH: ${{ inputs.branch }}
+          BOT: ${{ steps.token.outputs.app-slug }}
+          SOURCE: ${{ github.repository }}@${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          files=$(find "$TARGET" -type f \( -name '*.yaml' -o -name '*.yml' \) | sort)
+          [ -n "$files" ] || { echo "::error::no YAML under $TARGET"; exit 1; }
+
+          # Rewrite each image's tag under TARGET; the summary goes to a file
+          # so errors reach the log rather than a variable.
+          record() {
+            : > "$RUNNER_TEMP/summary"
+            for pair in $IMAGES; do
+              repo="${pair%%=*}"; tag="${pair#*=}"
+              case "$tag" in ""|*[!A-Za-z0-9._-]*) echo "::error::bad tag in '$pair'"; return 1;; esac
+              re="${REGISTRY//./\\.}/${repo//./\\.}(:[A-Za-z0-9._-]+)?(@sha256:[0-9a-f]{64})?([\"' ]|\$)"
+              grep -qE "$re" $files || { echo "::error::$REGISTRY/$repo appears nowhere under $TARGET"; return 1; }
+              sed -i -E "s#($re)#${REGISTRY}/${repo}:${tag}\\4#g" $files
+              printf ' %s:%s' "$repo" "$tag" >> "$RUNNER_TEMP/summary"
+            done
+          }
+
+          git config user.name "${BOT}[bot]"
+          git config user.email "${BOT}[bot]@users.noreply.github.com"
+          for attempt in 1 2 3 4 5; do
+            record
+            summary="$(cat "$RUNNER_TEMP/summary")"
+            if git diff --quiet; then
+              echo "Already deployed:$summary" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            git commit -q -am "Deploy$summary" -m "From $SOURCE ($RUN_URL)."
+            if git push -q origin "HEAD:$BRANCH"; then
+              echo "Recorded$summary in ${{ inputs.repository }}; Argo CD applies it." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            # Another commit landed first: start again from it.
+            git fetch -q origin "$BRANCH"
+            git reset -q --hard "origin/$BRANCH"
+            sleep $((attempt * 3))
+          done
+          echo "::error::could not push the deploy commit after 5 attempts"
+          exit 1
