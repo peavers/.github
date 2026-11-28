@@ -1,0 +1,97 @@
+# Install and check a Node package: npm install, then the package's own
+# scripts, so a repo's own workflow stays a few lines.
+#
+#   permissions:
+#     contents: read
+#     id-token: write        # Vault OIDC, for the Nexus npm registry
+#   jobs:
+#     node:
+#       uses: peavers/.github/.github/workflows/node.yml@v1
+#       with:
+#         scripts: lint test build
+#
+# Each script runs with `npm run <name> --if-present`, so a package without a
+# lint script is not an error. Checks beyond these go in their own job.
+name: Node
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Where package.json is.
+        type: string
+        default: "."
+      scripts:
+        description: Space-separated npm scripts to run, in order.
+        type: string
+        default: "lint test build"
+      node-version:
+        description: Default is .nvmrc or .node-version when present, else 22.
+        type: string
+        default: ""
+      nexus:
+        description: Write the Nexus npm scope into ~/.npmrc (private packages).
+        type: boolean
+        default: true
+      npm-scope:
+        type: string
+        default: "@parses"
+      extra:
+        description: A shell command run after the scripts, in working-directory.
+        type: string
+        default: ""
+      runner:
+        description: Runner label. Default is the repo's RUNNER_LABEL, else Blacksmith.
+        type: string
+        default: ""
+
+jobs:
+  node:
+    name: Node
+    runs-on: ${{ inputs.runner || vars.RUNNER_LABEL || 'blacksmith-4vcpu-ubuntu-2404' }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node version
+        id: version
+        run: |
+          v="${{ inputs.node-version }}"
+          for f in .nvmrc .node-version; do
+            [ -z "$v" ] && [ -f "$f" ] && v="$(tr -d ' \nv' < "$f")"
+          done
+          echo "node=${v:-22}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.version.outputs.node }}
+          # npm's cache needs a lockfile to key on.
+          cache: ${{ hashFiles(format('{0}/package-lock.json', inputs.working-directory)) != '' && 'npm' || '' }}
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - if: inputs.nexus
+        uses: peavers/.github/actions/valhalla-auth@v1
+        with:
+          npm: "true"
+          npm-scope: ${{ inputs.npm-scope }}
+
+      # install, not ci: some lockfiles here lag their package.json, and CI
+      # has always installed this way.
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Scripts
+        env:
+          SCRIPTS: ${{ inputs.scripts }}
+        run: |
+          for s in $SCRIPTS; do
+            echo "::group::npm run $s"
+            npm run "$s" --if-present
+            echo "::endgroup::"
+          done
+
+      - name: Extra
+        if: inputs.extra != ''
+        run: ${{ inputs.extra }}

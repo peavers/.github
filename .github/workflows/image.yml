@@ -1,0 +1,152 @@
+# Build a container image and push it to ECR. One workflow for both ways the
+# services here build: a Dockerfile, or Jib for the Spring services.
+#
+#   permissions:
+#     contents: read
+#     id-token: write        # AWS OIDC for ECR, and Vault OIDC for Nexus
+#   jobs:
+#     image:
+#       uses: peavers/.github/.github/workflows/image.yml@v1
+#       with:
+#         image: peavers/fleetkeeper-web     # the ECR repository
+#         context: web
+#
+# The tag is immutable: the semver of a v* tag, else the commit's 7-char SHA
+# (compute-version). The repository must already exist; peavers-code/ecr
+# creates them. To deploy the result, pass `version` to deploy.yml.
+name: Image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: ECR repository, e.g. peavers/fleetkeeper.
+        type: string
+        required: true
+      builder:
+        description: dockerfile or jib.
+        type: string
+        default: dockerfile
+      context:
+        description: Docker build context (dockerfile), or where gradlew is (jib).
+        type: string
+        default: "."
+      dockerfile:
+        description: Default is <context>/Dockerfile.
+        type: string
+        default: ""
+      target:
+        description: Dockerfile stage to build.
+        type: string
+        default: ""
+      build-args:
+        description: Newline-separated KEY=value build arguments (never secrets).
+        type: string
+        default: ""
+      platforms:
+        type: string
+        default: linux/amd64
+      java-version:
+        description: Jib only.
+        type: string
+        default: "25"
+      registry:
+        type: string
+        default: 665316247771.dkr.ecr.us-east-1.amazonaws.com
+      aws-role:
+        type: string
+        default: arn:aws:iam::665316247771:role/github-actions-ci
+      runner:
+        description: Runner label. Default is the repo's RUNNER_LABEL, else Blacksmith.
+        type: string
+        default: ""
+    outputs:
+      version:
+        description: The tag pushed.
+        value: ${{ jobs.image.outputs.version }}
+      ref:
+        description: registry/repository:version
+        value: ${{ jobs.image.outputs.ref }}
+      digest:
+        description: sha256:... of the pushed image.
+        value: ${{ jobs.image.outputs.digest }}
+
+jobs:
+  image:
+    name: Image
+    runs-on: ${{ inputs.runner || vars.RUNNER_LABEL || 'blacksmith-4vcpu-ubuntu-2404' }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      ref: ${{ steps.out.outputs.ref }}
+      digest: ${{ steps.out.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        uses: peavers/.github/actions/compute-version@v1
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ inputs.aws-role }}
+          aws-region: us-east-1
+
+      # Also lets Jib pull a base image that lives in ECR.
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      # Dockerfile
+      - if: inputs.builder == 'dockerfile'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: docker
+        if: inputs.builder == 'dockerfile'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile != '' && inputs.dockerfile || format('{0}/Dockerfile', inputs.context) }}
+          target: ${{ inputs.target }}
+          build-args: ${{ inputs.build-args }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ inputs.registry }}/${{ inputs.image }}:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.image }}
+          cache-to: type=gha,scope=${{ inputs.image }},mode=max
+
+      # Jib
+      - if: inputs.builder == 'jib'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: temurin
+
+      - if: inputs.builder == 'jib'
+        uses: gradle/actions/setup-gradle@v4
+
+      - if: inputs.builder == 'jib'
+        uses: peavers/.github/actions/valhalla-auth@v1
+        with:
+          maven: "true"
+
+      - name: Jib
+        if: inputs.builder == 'jib'
+        working-directory: ${{ inputs.context }}
+        run: |
+          ./gradlew jib --no-daemon \
+            -Djib.to.image=${{ inputs.registry }}/${{ inputs.image }}:${{ steps.version.outputs.version }}
+
+      - name: Result
+        id: out
+        env:
+          REF: ${{ inputs.registry }}/${{ inputs.image }}:${{ steps.version.outputs.version }}
+          DOCKER_DIGEST: ${{ steps.docker.outputs.digest }}
+          JIB_DIGEST_FILE: ${{ inputs.context }}/build/jib-image.digest
+        run: |
+          digest="$DOCKER_DIGEST"
+          if [ -z "$digest" ] && [ -f "$JIB_DIGEST_FILE" ]; then digest="$(cat "$JIB_DIGEST_FILE")"; fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed \`$REF\` ($digest)" >> "$GITHUB_STEP_SUMMARY"

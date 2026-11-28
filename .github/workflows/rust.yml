@@ -1,0 +1,108 @@
+# Format, lint and test a Cargo workspace: the same three checks every Rust
+# repo runs, so a repo's own workflow stays a few lines.
+#
+#   permissions:
+#     contents: read
+#     id-token: write        # Vault OIDC, for the Nexus cargo registry
+#   jobs:
+#     rust:
+#       uses: peavers/.github/.github/workflows/rust.yml@v1
+#       with:
+#         postgres: true       # tests that need a database
+#
+# Checks a repo needs beyond these go in their own job beside this one.
+name: Rust
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Where Cargo.toml is.
+        type: string
+        default: "."
+      postgres:
+        description: >-
+          Run a Postgres 16 service and export DATABASE_URL
+          (postgres://postgres:postgres@localhost:5432/postgres).
+        type: boolean
+        default: false
+      sqlx-offline:
+        description: Build sqlx queries from the checked-in .sqlx data, not a live database.
+        type: boolean
+        default: true
+      nexus:
+        description: Authenticate to the valhalla Nexus cargo registry.
+        type: boolean
+        default: true
+      clippy-args:
+        type: string
+        default: "--workspace --all-targets -- -D warnings"
+      test-args:
+        type: string
+        default: "--workspace"
+      extra:
+        description: A shell command run after the tests, in working-directory.
+        type: string
+        default: ""
+      runner:
+        description: Runner label. Default is the repo's RUNNER_LABEL, else Blacksmith.
+        type: string
+        default: ""
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ${{ inputs.runner || vars.RUNNER_LABEL || 'blacksmith-4vcpu-ubuntu-2404' }}
+    services:
+      postgres:
+        # An empty image skips the service.
+        image: ${{ inputs.postgres && 'postgres:16-alpine' || '' }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      CARGO_TERM_COLOR: always
+      SQLX_OFFLINE: ${{ inputs.sqlx-offline && 'true' || 'false' }}
+      DATABASE_URL: ${{ inputs.postgres && 'postgres://postgres:postgres@localhost:5432/postgres' || '' }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml wins when the repo pins one; otherwise stable.
+      - name: Toolchain
+        run: |
+          if [ -f rust-toolchain.toml ] || [ -f rust-toolchain ]; then
+            rustup show active-toolchain || rustup toolchain install
+          else
+            rustup toolchain install stable --profile minimal
+            rustup default stable
+          fi
+          rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ inputs.working-directory }}
+
+      - if: inputs.nexus
+        uses: peavers/.github/actions/valhalla-auth@v1
+        with:
+          cargo: "true"
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy ${{ inputs.clippy-args }}
+
+      - name: Test
+        run: cargo test ${{ inputs.test-args }}
+
+      - name: Extra
+        if: inputs.extra != ''
+        run: ${{ inputs.extra }}
